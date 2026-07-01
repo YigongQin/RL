@@ -15,8 +15,9 @@ import gc
 import os
 import time
 import warnings
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
@@ -1136,6 +1137,22 @@ def _create_advantage_estimator(master_config: MasterConfig):
     return adv_estimator
 
 
+@contextmanager
+def _pause_streaming_tool_call_sessions_for_refit(
+    policy_generation: GenerationInterface,
+) -> Iterator[None]:
+    """Pause streaming sessions before any refit collective starts."""
+    if not isinstance(policy_generation, VllmGeneration):
+        yield
+        return
+
+    try:
+        policy_generation.pause_streaming_tool_call_sessions()
+        yield
+    finally:
+        policy_generation.resume_streaming_tool_call_sessions()
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -1165,7 +1182,10 @@ def refit_policy_generation(
         if timer is not None
         else nullcontext()
     )
-    with timer_context:
+    with (
+        timer_context,
+        _pause_streaming_tool_call_sessions_for_refit(policy_generation),
+    ):
         # update weights
         update_success = False
         if colocated_inference:
@@ -2624,6 +2644,19 @@ def async_grpo_train(
     # Ensure collector knows initial weight version
     trajectory_collector.set_weight_version.remote(weight_version)
 
+    def stop_async_training_actors() -> None:
+        """Stop the replay buffer and trajectory collector after training."""
+        print("🛑 Stopping trajectory collection...")
+        try:
+            ray.kill(trajectory_collector)
+        except Exception as error:
+            print(f"Error stopping trajectory collector: {error}")
+
+        try:
+            ray.kill(replay_buffer)
+        except Exception as error:
+            print(f"Error stopping replay buffer: {error}")
+
     print("📦 Started continuous background trajectory collection")
 
     print(
@@ -2642,7 +2675,8 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
-            return
+            stop_async_training_actors()
+            raise
     else:
         print("🔄 Preparing policy generation for inference...")
         try:
@@ -2653,7 +2687,8 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
-            return
+            stop_async_training_actors()
+            raise
 
     print("✅ Policy generation setup complete, proceeding to validation...")
 
@@ -2712,6 +2747,7 @@ def async_grpo_train(
     print("✅ Buffer ready! Starting training loop...")
 
     # Main training loop
+    training_failed = False
     try:
         while step < master_config.grpo["max_num_steps"]:
             print(
@@ -3325,22 +3361,16 @@ def async_grpo_train(
                 return
 
     except Exception as e:
+        training_failed = True
         print(f"❌ Error in async loop: {e}")
         import traceback
 
         traceback.print_exc()
+        raise
 
     finally:
-        # Clean up
-        print("🛑 Stopping trajectory collection...")
-        try:
-            ray.kill(trajectory_collector)
-        except Exception as e:
-            print(f"Error stopping trajectory collector: {e}")
-
-        try:
-            ray.kill(replay_buffer)
-        except Exception as e:
-            print(f"Error stopping replay buffer: {e}")
-
-        print("Async GRPO training complete!")
+        stop_async_training_actors()
+        if training_failed:
+            print("Async GRPO training stopped after an error.")
+        else:
+            print("Async GRPO training complete!")
