@@ -225,13 +225,13 @@ def test_build_in_dataset(dataset_name, tokenizer):
         assert first_example["messages"][2]["content"] == "Saint Bernadette Soubirous"
     elif dataset_name == "AIME2024":
         assert first_example["messages"][1]["content"] == "204"
-        assert len(dataset.dataset) == 480
+        assert len(dataset.dataset) == 30
     elif dataset_name == "AIME2025":
         assert first_example["messages"][1]["content"] == "70"
-        assert len(dataset.dataset) == 480
+        assert len(dataset.dataset) == 30
     elif dataset_name == "AIME2026":
         assert first_example["messages"][1]["content"] == "277"
-        assert len(dataset.dataset) == 480
+        assert len(dataset.dataset) == 30
 
     # check the combined message
     chat_template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
