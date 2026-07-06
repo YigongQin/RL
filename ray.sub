@@ -22,7 +22,8 @@
 # limitations under the License.
 
 
-set -eoux pipefail
+# Do not enable xtrace here: COMMAND commonly contains authentication tokens.
+set -euo pipefail
 
 ########################################################
 # Function to detect if SLURM cluster uses GRES
@@ -212,8 +213,6 @@ head_cmd=$(cat <<EOF
 # Touch a file to indicate that the head node has started
 # Overlapping srun commands will check this file to determine if we can overlap a container command
 touch $LOG_DIR/STARTED_RAY_HEAD
-env
-
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
     pkill -P $$ || true
@@ -317,8 +316,6 @@ for ((i = 1; i < SLURM_JOB_NUM_NODES; i++)); do
   node_i=${nodes_array[$i]}
     
   worker_cmd=$(cat <<EOF
-env
-
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
     pkill -P $$ || true

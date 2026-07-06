@@ -245,6 +245,23 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
+        self._dp_cp_collective_warmed = False
+
+    def _warm_up_dp_cp_collective(self) -> None:
+        """Initialize the DP-CP NCCL communicator before backward peak memory."""
+        if self._dp_cp_collective_warmed:
+            return
+
+        warmup_tensor = torch.zeros(
+            1,
+            dtype=torch.int64,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+        torch.distributed.all_reduce(
+            warmup_tensor,
+            group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+        )
+        self._dp_cp_collective_warmed = True
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
@@ -280,6 +297,8 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
             mbs = self.cfg["train_micro_batch_size"]
+        if not eval_mode:
+            self._warm_up_dp_cp_collective()
         local_gbs = gbs // self.dp_size
         total_dataset_size = torch.tensor(data.size, device="cuda")
         torch.distributed.all_reduce(
@@ -1149,9 +1168,11 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         torch.cuda.empty_cache()
 
     def start_gen_benchmark_keepalive(self) -> None:
-        """Benchmark-only: keep this training GPU non-idle while real training is
-        skipped (gen_benchmark_skip_training), so the cluster's idle-GPU reaper does
-        not kill the job. Spawns one daemon thread doing a tiny periodic matmul.
+        """Keep this training GPU non-idle for generation benchmarks.
+
+        When real training is skipped (gen_benchmark_skip_training), keep the
+        cluster's idle-GPU reaper from killing the job by spawning one daemon thread
+        that does a tiny periodic matmul.
 
         The matmul is a purely local op (no collectives), so it cannot desync the
         weight-sync NCCL collectives that still run every step.

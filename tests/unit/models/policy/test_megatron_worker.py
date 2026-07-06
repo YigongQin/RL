@@ -15,6 +15,7 @@ import os
 import tempfile
 import time
 from typing import Optional
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -34,10 +35,42 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.workers.megatron_policy_worker import (
+    MegatronPolicyWorkerImpl,
+)
 from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.test_utils import SimpleLossFn
 
 pytestmark = pytest.mark.mcore
+
+
+def test_dp_cp_collective_warmup_runs_once() -> None:
+    """The DP-CP communicator is initialized once before training."""
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker._dp_cp_collective_warmed = False
+    warmup_tensor = MagicMock()
+    dp_cp_group = MagicMock()
+
+    with (
+        patch.object(torch.cuda, "current_device", return_value=3),
+        patch.object(torch, "zeros", return_value=warmup_tensor) as zeros,
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker."
+            "parallel_state.get_data_parallel_group",
+            return_value=dp_cp_group,
+        ) as get_data_parallel_group,
+        patch.object(torch.distributed, "all_reduce") as all_reduce,
+    ):
+        worker._warm_up_dp_cp_collective()
+        worker._warm_up_dp_cp_collective()
+
+    zeros.assert_called_once_with(
+        1,
+        dtype=torch.int64,
+        device=torch.device("cuda", 3),
+    )
+    get_data_parallel_group.assert_called_once_with(with_context_parallel=True)
+    all_reduce.assert_called_once_with(warmup_tensor, group=dp_cp_group)
 
 
 def create_megatron_test_config(
