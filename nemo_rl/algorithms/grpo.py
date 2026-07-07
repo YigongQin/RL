@@ -1098,7 +1098,6 @@ def setup(
             if (
                 colocated_inference
                 or not policy_config["megatron_cfg"]["enabled"]
-                or vllm_cfg["async_engine"]
                 or vllm_cfg["precision"] == "fp8"
                 or vllm_cfg["kv_cache_dtype"].startswith("fp8")
                 or not generation_config.get("delta_compression")
@@ -1107,8 +1106,7 @@ def setup(
             ):
                 raise ValueError(
                     f"{refit_transport} requires a non-colocated Megatron policy, "
-                    "synchronous BF16/FP16 vLLM, delta compression, an unquantized "
-                    "rollout."
+                    "BF16/FP16 vLLM, delta compression, and an unquantized rollout."
                 )
 
         if generation_config["vllm_cfg"]["precision"] == "fp8":

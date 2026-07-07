@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -25,7 +26,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 import ray
@@ -360,6 +361,80 @@ def test_sparse_refit_batch_falls_back_across_nodes() -> None:
         for payload in (b"0", b"1", b"2")
     ]
     assert response == {"ok": True, "receiver_total_s": 3.0, "payloads": 3}
+
+
+@pytest.mark.asyncio
+async def test_async_sparse_refit_batch_bridges_to_async_collective(
+    tmp_path: Path,
+) -> None:
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    staged_payloads: list[bytes] = []
+
+    class AsyncLlm:
+        async def collective_rpc(
+            self, method: str, args: tuple[Any, ...]
+        ) -> list[dict[str, Any]]:
+            assert method == "update_weights_from_sparse_payload_files"
+            staged_payloads.extend(Path(path).read_bytes() for path in args)
+            return [{"ok": True, "receiver_total_s": 1.0}]
+
+    worker.llm = AsyncLlm()
+    worker._refit_async_loop = asyncio.get_running_loop()
+    worker._refit_workers_share_node = True
+    worker._refit_batch_staging_dir = str(tmp_path)
+
+    response = await asyncio.to_thread(
+        worker.update_weights_from_serialized_sparse_payloads,
+        (b"0", b"1"),
+    )
+
+    assert staged_payloads == [b"0", b"1"]
+    assert response == {"ok": True, "receiver_total_s": 1.0, "payloads": 2}
+
+
+@pytest.mark.asyncio
+async def test_async_sparse_refit_post_init_records_worker_locality() -> None:
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"refit_transport": "vllm_zmq_sparse"}
+    worker._mtp_load_from_disk = False
+    worker.report_device_id_async = AsyncMock(return_value=["0"])
+    worker.llm = MagicMock()
+    worker.llm.collective_rpc = AsyncMock(return_value=["node-0", "node-0"])
+
+    await worker.post_init_async()
+
+    assert worker.vllm_device_ids == ["0"]
+    assert worker._refit_workers_share_node is True
+    worker.llm.collective_rpc.assert_awaited_once_with("report_node_hostname", args=())
+
+
+def test_async_sparse_refit_exposes_zmq_relay(monkeypatch) -> None:
+    server = MagicMock()
+    server_type = MagicMock(return_value=server)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker.ZmqSparseRefitServer",
+        server_type,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker._get_free_port_local",
+        lambda *_args: 12345,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker._get_node_ip_local",
+        lambda: "10.0.0.1",
+    )
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"zmq_refit_server_port": None}}
+    worker._zmq_refit_server = None
+
+    assert worker.start_zmq_sparse_refit_relay(["http://receiver"]) == (
+        "tcp://10.0.0.1:12345"
+    )
+    server.start.assert_called_once_with()
+
+    worker.stop_zmq_sparse_refit_relay()
+    server.close.assert_called_once_with()
+    assert worker._zmq_refit_server is None
 
 
 basic_lora_test_config: LoRAConfig = {

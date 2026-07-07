@@ -227,6 +227,7 @@ class BaseVllmGenerationWorker:
         )
         self._refit_http_server: tuple[Any, threading.Thread, str] | None = None
         self._zmq_refit_server: tuple[ZmqSparseRefitServer, str] | None = None
+        self._refit_async_loop: asyncio.AbstractEventLoop | None = None
 
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
@@ -711,6 +712,57 @@ class BaseVllmGenerationWorker:
             )
         return response
 
+    def _refit_collective_rpc(
+        self,
+        method: str,
+        args: tuple[Any, ...],
+    ) -> Any:
+        return self.llm.collective_rpc(method, args=args)
+
+    def update_weights_from_serialized_sparse_payloads(
+        self,
+        serialized_payloads: tuple[bytes, ...],
+    ) -> dict[str, Any]:
+        """Apply a FIFO batch of sparse deltas through one collective RPC."""
+        if self.llm is None:
+            raise RuntimeError("vLLM is not initialized on this worker.")
+        if not self._refit_workers_share_node:
+            results = [
+                self._refit_collective_response(
+                    self._refit_collective_rpc(
+                        "update_weights_from_serialized_sparse_payload",
+                        (payload,),
+                    )
+                )
+                for payload in serialized_payloads
+            ]
+            timing: dict[str, float] = {}
+            merge_vllm_refit_receiver_timing(timing, results, maximum=False)
+            return {"ok": True, "payloads": len(serialized_payloads), **timing}
+
+        with tempfile.TemporaryDirectory(
+            prefix="nemo_rl_refit_", dir=self._refit_batch_staging_dir
+        ) as staging_dir:
+            paths = []
+            for index, payload in enumerate(serialized_payloads):
+                path = os.path.join(staging_dir, str(index))
+                with open(path, "wb") as staged:
+                    staged.write(payload)
+                paths.append(path)
+            try:
+                response = self._refit_collective_response(
+                    self._refit_collective_rpc(
+                        "update_weights_from_sparse_payload_files",
+                        tuple(paths),
+                    )
+                )
+            except Exception:
+                # Drain peers before TemporaryDirectory removes shared batch files.
+                self._refit_collective_rpc("synchronize_device", ())
+                raise
+        response["payloads"] = len(serialized_payloads)
+        return response
+
     def _flush_queued_sparse_payloads(self) -> dict[str, Any]:
         started = time.perf_counter()
         submitted = None
@@ -731,7 +783,7 @@ class BaseVllmGenerationWorker:
             assert self.llm is not None
             response.update(
                 self._refit_collective_response(
-                    self.llm.collective_rpc("finish_sparse_delta_refit", args=())
+                    self._refit_collective_rpc("finish_sparse_delta_refit", ())
                 )
             )
         with self._refit_apply_queue_condition:
@@ -815,6 +867,8 @@ class BaseVllmGenerationWorker:
             raw_request: Request,
             action: Literal["s3", "flush", "zmq"],
         ) -> JSONResponse:
+            if self.cfg["vllm_cfg"]["async_engine"]:
+                self._refit_async_loop = asyncio.get_running_loop()
             if (
                 token is not None
                 and raw_request.headers.get(G_VLLM_REFIT_API_KEY_HEADER) != token
@@ -852,6 +906,32 @@ class BaseVllmGenerationWorker:
 
     def report_refit_server_base_url(self) -> str | None:
         return self._refit_http_server[2] if self._refit_http_server else None
+
+    def start_zmq_sparse_refit_relay(self, refit_urls: list[str]) -> str:
+        if self._zmq_refit_server is not None:
+            return self._zmq_refit_server[1]
+        port = self.cfg["vllm_cfg"].get(
+            "zmq_refit_server_port"
+        ) or _get_free_port_local(
+            self.cfg.get("port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW),
+            self.cfg.get("port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH),
+        )
+        server = ZmqSparseRefitServer(
+            refit_urls,
+            bind_address=f"tcp://0.0.0.0:{port}",
+            api_key_env_var=self.cfg["vllm_cfg"].get("http_refit_api_key_env_var"),
+            timeout_s=float(os.getenv("NRL_REFIT_ZMQ_TIMEOUT_S") or 600.0),
+        )
+        server.start()
+        address = f"tcp://{_get_node_ip_local()}:{port}"
+        self._zmq_refit_server = (server, address)
+        print(f"Starting vLLM ZeroMQ refit relay on {address}", flush=True)
+        return address
+
+    def stop_zmq_sparse_refit_relay(self) -> None:
+        if self._zmq_refit_server is not None:
+            self._zmq_refit_server[0].close()
+        self._zmq_refit_server = None
 
 
 class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
@@ -897,35 +977,6 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         base_url = f"http://{_get_node_ip_local()}:{port}"
         self._refit_http_server = (server, thread, base_url)
         print(f"Starting vLLM refit server on {base_url}", flush=True)
-
-    def start_zmq_sparse_refit_relay(self, refit_urls: list[str]) -> str:
-        if self._zmq_refit_server is not None:
-            return self._zmq_refit_server[1]
-        port = self.cfg["vllm_cfg"].get(
-            "zmq_refit_server_port"
-        ) or _get_free_port_local(
-            self.cfg.get("port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW),
-            self.cfg.get("port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH),
-        )
-        server = ZmqSparseRefitServer(
-            refit_urls,
-            bind_address=f"tcp://0.0.0.0:{port}",
-            api_key_env_var=self.cfg["vllm_cfg"].get("http_refit_api_key_env_var"),
-            timeout_s=float(os.getenv("NRL_REFIT_ZMQ_TIMEOUT_S") or 600.0),
-        )
-        server.start()
-        address = f"tcp://{_get_node_ip_local()}:{port}"
-        self._zmq_refit_server = (server, address)
-        print(
-            f"Starting vLLM ZeroMQ refit relay on {address}",
-            flush=True,
-        )
-        return address
-
-    def stop_zmq_sparse_refit_relay(self) -> None:
-        if self._zmq_refit_server is not None:
-            self._zmq_refit_server[0].close()
-        self._zmq_refit_server = None
 
     def init_collective(
         self,
@@ -1278,55 +1329,6 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             print(f"Exception during collective_rpc for weight update: {e}")
             traceback.print_exc()
             return False
-
-    def update_weights_from_serialized_sparse_payloads(
-        self,
-        serialized_payloads: tuple[bytes, ...],
-    ) -> dict[str, Any]:
-        """Apply a FIFO batch of sparse deltas through one collective RPC."""
-        if self.llm is None:
-            raise RuntimeError(
-                "Attempting to update weights with either an uninitialized vLLM "
-                "or non-model-owner"
-            )
-        if not self._refit_workers_share_node:
-            results = [
-                self._refit_collective_response(
-                    self.llm.collective_rpc(
-                        "update_weights_from_serialized_sparse_payload",
-                        args=(payload,),
-                    )
-                )
-                for payload in serialized_payloads
-            ]
-            timing: dict[str, float] = {}
-            merge_vllm_refit_receiver_timing(timing, results, maximum=False)
-            return {"ok": True, "payloads": len(serialized_payloads), **timing}
-
-        with tempfile.TemporaryDirectory(
-            prefix="nemo_rl_refit_", dir=self._refit_batch_staging_dir
-        ) as staging_dir:
-            paths = []
-            for index, payload in enumerate(serialized_payloads):
-                path = os.path.join(staging_dir, str(index))
-                with open(path, "wb") as staged:
-                    staged.write(payload)
-                paths.append(path)
-            try:
-                response = self._refit_collective_response(
-                    self.llm.collective_rpc(
-                        "update_weights_from_sparse_payload_files",
-                        args=tuple(paths),
-                    )
-                )
-            except Exception:
-                # Ray may surface one worker error before peers finish reading
-                # the shared files. Queueing a barrier drains those calls before
-                # TemporaryDirectory removes the batch.
-                self.llm.collective_rpc("synchronize_device", args=())
-                raise
-        response["payloads"] = len(serialized_payloads)
-        return response
 
     def reset_prefix_cache(self):
         """Reset the prefix cache of vLLM engine."""
