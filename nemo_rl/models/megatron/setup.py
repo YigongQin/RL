@@ -1206,12 +1206,17 @@ def setup_model_and_optimizer(
     # Context used for persisting some state between checkpoint saves.
     checkpointing_context = init_checkpointing_context(megatron_cfg.checkpoint)
 
-    # Tokenizer
-    # ``TokenizerConfig.__post_init__`` bakes ``hf_tokenizer_kwargs["trust_remote_code"]``
-    # into the ``trust_remote_code`` attribute at construction time; mutating the dict
-    # here has no effect because ``build_tokenizer`` reads the attribute, not the dict.
-    # Set the attribute directly on this per-call config object (not a global mutation).
-    # See NVIDIA-NeMo/RL#2764.
+    # Tokenizer: enable trust_remote_code so remote-code tokenizers (e.g. the
+    # TikTokenTokenizer that ships with Moonlight-16B-A3B / deepseek_v3) can load.
+    #
+    # We set the attribute directly, NOT megatron_cfg.tokenizer.hf_tokenizer_kwargs
+    # ["trust_remote_code"], because Megatron-Bridge's TokenizerConfig.__post_init__
+    # snapshots that dict once at construction time into a plain `trust_remote_code`
+    # attribute -- see Megatron-Bridge/src/megatron/bridge/training/tokenizers/config.py.
+    # From then on build_tokenizer reads the attribute, so any later mutation of the
+    # dict is silently a no-op. Assigning the attribute directly is the API the
+    # Megatron-Bridge deprecation notice itself recommends, and it is scoped to this
+    # single per-call config object -- no global state is touched.
     megatron_cfg.tokenizer.trust_remote_code = True
     build_tokenizer(
         megatron_cfg.tokenizer,

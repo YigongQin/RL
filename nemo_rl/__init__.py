@@ -275,21 +275,31 @@ _patch_nsight_file()
 
 
 def _patch_transformers_tokenizer_class_set():
-    """Un-blocklist ``deepseek_v3`` in transformers' ``MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS``.
+    """Allow AutoTokenizer to load deepseek_v3 models (e.g. Moonlight-16B-A3B) offline.
 
-    transformers>=5.4 added ``deepseek_v3`` to this set, which silently overrides
-    ``trust_remote_code=True`` and forces the fast tokenizer backend. Under
-    ``HF_HUB_OFFLINE=1`` that backend cannot enumerate repo files to find
-    ``tiktoken.model`` and raises ``ValueError: Couldn't instantiate the backend
-    tokenizer`` for Moonlight-16B-A3B (fixes NVIDIA-NeMo/RL#2764).
+    In transformers 5.4-5.11 the "deepseek_v3" model_type is listed in two
+    internal registries that together force AutoTokenizer down the fast-tokenizer
+    path even when the caller passes trust_remote_code=True:
 
-    ``discard`` is idempotent and no-ops if the set or the entry is absent, so
-    this stays safe across transformers versions that don't need the patch.
+      * MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS -- a set that suppresses the
+        model's tokenizer_class / auto_map hints.
+      * TOKENIZER_MAPPING_NAMES -- a dict that pins deepseek_v3 to the fast
+        "TokenizersBackend" implementation.
 
-    TODO(#2764): Remove this patch once we bump the transformers pin past the
-    upstream fix. Per NVIDIA-NeMo/RL#2764, the issue is resolved in
-    transformers>=5.12.1; the current pin is ``>=5.5.0,<5.9.0`` and cannot bump
-    until Megatron-Bridge relaxes its upper bound.
+    The fast backend needs to enumerate the model repo (or a local
+    tokenizer.json) to build itself. Moonlight-16B-A3B ships neither -- only
+    tiktoken.model plus a TikTokenTokenizer class exposed via auto_map. With
+    HF_HUB_OFFLINE=1 (used by CI and any air-gapped run) the fast backend
+    therefore raises "ValueError: Couldn't instantiate the backend tokenizer",
+    and AutoTokenizer never falls back to the slow tokenizer.
+
+    Removing the two entries lets AutoTokenizer honor trust_remote_code=True,
+    load the auto_map's TikTokenTokenizer via the model's remote code, and
+    succeed offline. discard()/pop() with a default are both no-ops when the
+    entries are absent, so this is safe on any transformers version.
+
+    TODO: Delete this once the transformers pin is bumped past the upstream fix
+    (~transformers 5.12+); today the pin is capped by Megatron-Bridge.
     """
     try:
         from transformers.models.auto.tokenization_auto import (
@@ -298,8 +308,6 @@ def _patch_transformers_tokenizer_class_set():
         )
 
         MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS.discard("deepseek_v3")
-        # Also clear the mapping dict entry set at module load time; see
-        # nemo_rl/models/megatron/setup.py _patch_tokenizer_auto_blocklist for details.
         TOKENIZER_MAPPING_NAMES.pop("deepseek_v3", None)
     except ImportError:
         pass
