@@ -1206,17 +1206,20 @@ def setup_model_and_optimizer(
     # Context used for persisting some state between checkpoint saves.
     checkpointing_context = init_checkpointing_context(megatron_cfg.checkpoint)
 
-    # Tokenizer: enable trust_remote_code so remote-code tokenizers (e.g. the
-    # TikTokenTokenizer that ships with Moonlight-16B-A3B / deepseek_v3) can load.
+    # Tokenizer: enable trust_remote_code so tokenizers that live in the model repo
+    # as remote code (e.g. the TikTokenTokenizer that ships with Moonlight-16B-A3B /
+    # deepseek_v3) can be loaded by AutoTokenizer. Applies to every model that goes
+    # through this codepath, matching what the surrounding AutoBridge / TokenizerConfig
+    # calls in this file (lines 486, 1645, 1658) already do -- there is no non-
+    # trust_remote_code path here.
     #
-    # We set the attribute directly, NOT megatron_cfg.tokenizer.hf_tokenizer_kwargs
+    # We set the attribute directly rather than megatron_cfg.tokenizer.hf_tokenizer_kwargs
     # ["trust_remote_code"], because Megatron-Bridge's TokenizerConfig.__post_init__
     # snapshots that dict once at construction time into a plain `trust_remote_code`
-    # attribute -- see Megatron-Bridge/src/megatron/bridge/training/tokenizers/config.py.
+    # attribute (see Megatron-Bridge/src/megatron/bridge/training/tokenizers/config.py).
     # From then on build_tokenizer reads the attribute, so any later mutation of the
-    # dict is silently a no-op. Assigning the attribute directly is the API the
-    # Megatron-Bridge deprecation notice itself recommends, and it is scoped to this
-    # single per-call config object -- no global state is touched.
+    # dict is a silent no-op. Attribute assignment is the API the Megatron-Bridge
+    # deprecation notice recommends.
     megatron_cfg.tokenizer.trust_remote_code = True
     build_tokenizer(
         megatron_cfg.tokenizer,
