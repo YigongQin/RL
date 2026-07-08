@@ -153,6 +153,90 @@ from nemo_rl.models.value.config import ValueConfig
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+def _patch_tokenizer_auto_blocklist() -> None:
+    """Remove ``deepseek_v3`` from transformers' auto-tokenizer blocklist.
+
+    transformers>=5.4 added ``deepseek_v3`` to
+    ``MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS``, which silently forces
+    ``trust_remote_code=False`` and ``TokenizersBackend`` for any model whose
+    ``config.model_type == "deepseek_v3"`` (including Moonlight-16B-A3B).
+    Under ``HF_HUB_OFFLINE=1`` the fast ``TokenizersBackend`` cannot locate a
+    ``tokenizer.json`` and raises ``ValueError: Couldn't instantiate the
+    backend tokenizer``.
+
+    This patch is idempotent: ``.discard`` is a no-op if the entry is absent.
+    It is re-applied here (in addition to ``nemo_rl/__init__.py``) because
+    ``HuggingFaceTokenizer`` (in read-only Megatron-LM) imports ``AutoTokenizer``
+    at *module load time*, which populates the blocklist before ``nemo_rl``
+    has a chance to import.  Calling the patch here, immediately before every
+    tokenizer construction, guarantees the entry is absent regardless of
+    import ordering in the Ray worker process.
+
+    See NVIDIA-NeMo/RL#2764.
+
+    TODO(#2764): Remove once transformers pin exceeds the upstream fix
+    (transformers>=5.12.1).  Current pin ``>=5.5.0,<5.9.0`` cannot bump until
+    Megatron-Bridge relaxes its upper bound.
+    """
+    try:
+        from transformers.models.auto.tokenization_auto import (
+            MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS,
+            TOKENIZER_MAPPING_NAMES,
+        )
+
+        had_entry = "deepseek_v3" in MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS
+        MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS.discard("deepseek_v3")
+        # Also remove from the mapping dict populated at module load time by the
+        # module-level ``for model_type in MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS``
+        # loop (tokenization_auto.py lines 388-390).  Clearing only the set is
+        # insufficient because AutoTokenizer.from_pretrained's ``has_local_code``
+        # check (line 755) queries TOKENIZER_MAPPING which is backed by
+        # TOKENIZER_MAPPING_NAMES, and that dict persists ``"deepseek_v3":
+        # "TokenizersBackend"`` even after the set is cleared.
+        mapping_had_entry = "deepseek_v3" in TOKENIZER_MAPPING_NAMES
+        TOKENIZER_MAPPING_NAMES.pop("deepseek_v3", None)
+        print(
+            f"[nemo_rl] _patch_tokenizer_auto_blocklist: "
+            f"set_had_entry={had_entry}, mapping_had_entry={mapping_had_entry}, "
+            f"transformers_module={MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS.__class__.__module__}",
+            flush=True,
+        )
+    except ImportError:
+        pass
+
+
+def _build_tokenizer_with_slow_fallback(tokenizer_config, **kwargs):
+    """Wrap ``build_tokenizer`` with a slow-tokenizer fallback.
+
+    Some models (e.g. Moonlight-16B-A3B / deepseek_v3) ship a slow-only
+    ``TikTokenTokenizer`` via ``auto_map`` with no ``tokenizer.json``.  The
+    ``__init__.py`` monkey-patch that removes ``deepseek_v3`` from transformers'
+    ``MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS`` can race with the module-level
+    ``from transformers import AutoTokenizer`` in ``huggingface_tokenizer.py``
+    (which populates the blocklist on first import).  Calling
+    ``_patch_tokenizer_auto_blocklist()`` here, immediately before every
+    tokenizer construction, guarantees the patch takes effect in every process
+    context (driver or Ray worker) regardless of import order.  See
+    NVIDIA-NeMo/RL#2764.
+    """
+    _patch_tokenizer_auto_blocklist()
+    try:
+        return build_tokenizer(tokenizer_config, **kwargs)
+    except ValueError as err:
+        if "backend tokenizer" not in str(err):
+            raise
+        if tokenizer_config.hf_tokenizer_kwargs is None:
+            tokenizer_config.hf_tokenizer_kwargs = {}
+        tokenizer_config.hf_tokenizer_kwargs["use_fast"] = False
+        # TokenizerConfig.__post_init__ bakes hf_tokenizer_kwargs["use_fast"] into
+        # tokenizer_hf_no_use_fast at construction time.  Mutating the dict after the
+        # fact has no effect because build_mcore_tokenizer reads the attribute, not the
+        # dict.  Set the attribute directly so the retry actually gets use_fast=False.
+        tokenizer_config.tokenizer_hf_no_use_fast = True
+        _patch_tokenizer_auto_blocklist()
+        return build_tokenizer(tokenizer_config, **kwargs)
+
+
 def destroy_parallel_state():
     """Safely destroy parallel state and reset async call tracking.
 
@@ -1210,8 +1294,7 @@ def setup_model_and_optimizer(
     if megatron_cfg.tokenizer.hf_tokenizer_kwargs is None:
         megatron_cfg.tokenizer.hf_tokenizer_kwargs = {}
     megatron_cfg.tokenizer.hf_tokenizer_kwargs["trust_remote_code"] = True
-    megatron_cfg.tokenizer.hf_tokenizer_kwargs["use_fast"] = True
-    build_tokenizer(
+    _build_tokenizer_with_slow_fallback(
         megatron_cfg.tokenizer,
         make_vocab_size_divisible_by=megatron_cfg.model.make_vocab_size_divisible_by
         // megatron_cfg.model.tensor_model_parallel_size,
@@ -1636,11 +1719,10 @@ def finalize_megatron_setup(
         tokenizer_model=hf_model_name,
         hf_tokenizer_kwargs={
             "trust_remote_code": True,
-            "use_fast": True,
         },
     )
 
-    megatron_tokenizer = build_tokenizer(
+    megatron_tokenizer = _build_tokenizer_with_slow_fallback(
         tokenizer_config,
         make_vocab_size_divisible_by=megatron_cfg.model.make_vocab_size_divisible_by
         // config["megatron_cfg"]["tensor_model_parallel_size"],

@@ -274,6 +274,40 @@ def _patch_nsight_file():
 _patch_nsight_file()
 
 
+def _patch_transformers_tokenizer_class_set():
+    """Un-blocklist ``deepseek_v3`` in transformers' ``MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS``.
+
+    transformers>=5.4 added ``deepseek_v3`` to this set, which silently overrides
+    ``trust_remote_code=True`` and forces the fast tokenizer backend. Under
+    ``HF_HUB_OFFLINE=1`` that backend cannot enumerate repo files to find
+    ``tiktoken.model`` and raises ``ValueError: Couldn't instantiate the backend
+    tokenizer`` for Moonlight-16B-A3B (fixes NVIDIA-NeMo/RL#2764).
+
+    ``discard`` is idempotent and no-ops if the set or the entry is absent, so
+    this stays safe across transformers versions that don't need the patch.
+
+    TODO(#2764): Remove this patch once we bump the transformers pin past the
+    upstream fix. Per NVIDIA-NeMo/RL#2764, the issue is resolved in
+    transformers>=5.12.1; the current pin is ``>=5.5.0,<5.9.0`` and cannot bump
+    until Megatron-Bridge relaxes its upper bound.
+    """
+    try:
+        from transformers.models.auto.tokenization_auto import (
+            MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS,
+            TOKENIZER_MAPPING_NAMES,
+        )
+
+        MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS.discard("deepseek_v3")
+        # Also clear the mapping dict entry set at module load time; see
+        # nemo_rl/models/megatron/setup.py _patch_tokenizer_auto_blocklist for details.
+        TOKENIZER_MAPPING_NAMES.pop("deepseek_v3", None)
+    except ImportError:
+        pass
+
+
+_patch_transformers_tokenizer_class_set()
+
+
 # Need to set PYTHONPATH to include transformers downloaded modules.
 # Assuming the cache directory is the same cross venvs.
 def patch_transformers_module_dir(env_vars: dict[str, str]):
