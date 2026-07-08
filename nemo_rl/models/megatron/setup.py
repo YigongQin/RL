@@ -1294,6 +1294,11 @@ def setup_model_and_optimizer(
     if megatron_cfg.tokenizer.hf_tokenizer_kwargs is None:
         megatron_cfg.tokenizer.hf_tokenizer_kwargs = {}
     megatron_cfg.tokenizer.hf_tokenizer_kwargs["trust_remote_code"] = True
+    # TokenizerConfig.__post_init__ bakes hf_tokenizer_kwargs["trust_remote_code"] into
+    # the trust_remote_code attribute at construction time; mutating the dict after the
+    # fact has no effect because build_tokenizer reads the attribute, not the dict.
+    # Set the attribute directly so the tokenizer call actually gets trust_remote_code=True.
+    megatron_cfg.tokenizer.trust_remote_code = True
     _build_tokenizer_with_slow_fallback(
         megatron_cfg.tokenizer,
         make_vocab_size_divisible_by=megatron_cfg.model.make_vocab_size_divisible_by
