@@ -275,31 +275,22 @@ _patch_nsight_file()
 
 
 def _patch_transformers_tokenizer_class_set():
-    """Allow AutoTokenizer to load deepseek_v3 models (e.g. Moonlight-16B-A3B) offline.
+    """Undo the transformers block on deepseek_v3 tokenizers.
 
-    In transformers 5.4-5.11 the "deepseek_v3" model_type is listed in two
-    internal registries that together force AutoTokenizer down the fast-tokenizer
-    path even when the caller passes trust_remote_code=True:
+    Root cause: transformers 5.4-5.11 lists "deepseek_v3" in two internal
+    registries -- MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS (a set) and
+    TOKENIZER_MAPPING_NAMES (a dict pinning it to "TokenizersBackend"). Together
+    they force the fast tokenizer backend and suppress trust_remote_code, so
+    AutoTokenizer can only load via a local tokenizer.json. Models like
+    Moonlight-16B-A3B ship no tokenizer.json (only tiktoken.model + a remote-code
+    TikTokenTokenizer), so offline loading fails.
 
-      * MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS -- a set that suppresses the
-        model's tokenizer_class / auto_map hints.
-      * TOKENIZER_MAPPING_NAMES -- a dict that pins deepseek_v3 to the fast
-        "TokenizersBackend" implementation.
+    Removing both entries restores the trust_remote_code / auto_map path.
+    discard/pop-with-default are no-ops when the entries are absent, so this is
+    safe on any transformers version.
 
-    The fast backend needs to enumerate the model repo (or a local
-    tokenizer.json) to build itself. Moonlight-16B-A3B ships neither -- only
-    tiktoken.model plus a TikTokenTokenizer class exposed via auto_map. With
-    HF_HUB_OFFLINE=1 (used by CI and any air-gapped run) the fast backend
-    therefore raises "ValueError: Couldn't instantiate the backend tokenizer",
-    and AutoTokenizer never falls back to the slow tokenizer.
-
-    Removing the two entries lets AutoTokenizer honor trust_remote_code=True,
-    load the auto_map's TikTokenTokenizer via the model's remote code, and
-    succeed offline. discard()/pop() with a default are both no-ops when the
-    entries are absent, so this is safe on any transformers version.
-
-    TODO: Delete this once the transformers pin is bumped past the upstream fix
-    (~transformers 5.12+); today the pin is capped by Megatron-Bridge.
+    TODO: delete once the transformers pin is bumped past the upstream fix
+    (~5.12+); today the pin is capped by Megatron-Bridge.
     """
     try:
         from transformers.models.auto.tokenization_auto import (

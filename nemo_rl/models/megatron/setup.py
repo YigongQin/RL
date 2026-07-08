@@ -1206,20 +1206,17 @@ def setup_model_and_optimizer(
     # Context used for persisting some state between checkpoint saves.
     checkpointing_context = init_checkpointing_context(megatron_cfg.checkpoint)
 
-    # Tokenizer: enable trust_remote_code so tokenizers that live in the model repo
-    # as remote code (e.g. the TikTokenTokenizer that ships with Moonlight-16B-A3B /
-    # deepseek_v3) can be loaded by AutoTokenizer. Applies to every model that goes
-    # through this codepath, matching what the surrounding AutoBridge / TokenizerConfig
-    # calls in this file (lines 486, 1645, 1658) already do -- there is no non-
-    # trust_remote_code path here.
+    # Enable trust_remote_code for tokenizer construction (needed for remote-code
+    # tokenizers like Moonlight/deepseek_v3's TikTokenTokenizer). Root cause of
+    # the direct attribute assignment: TokenizerConfig.__post_init__ snapshots
+    # hf_tokenizer_kwargs into a plain trust_remote_code attribute at construction
+    # time (Megatron-Bridge/src/megatron/bridge/training/tokenizers/config.py),
+    # after which build_tokenizer reads the attribute, not the dict -- so any later
+    # dict mutation is a silent no-op. Matches trust_remote_code=True used by the
+    # sibling AutoBridge / TokenizerConfig calls in this file.
     #
-    # We set the attribute directly rather than megatron_cfg.tokenizer.hf_tokenizer_kwargs
-    # ["trust_remote_code"], because Megatron-Bridge's TokenizerConfig.__post_init__
-    # snapshots that dict once at construction time into a plain `trust_remote_code`
-    # attribute (see Megatron-Bridge/src/megatron/bridge/training/tokenizers/config.py).
-    # From then on build_tokenizer reads the attribute, so any later mutation of the
-    # dict is a silent no-op. Attribute assignment is the API the Megatron-Bridge
-    # deprecation notice recommends.
+    # TODO: revisit when transformers is bumped past ~5.12; upstream may make
+    # trust_remote_code unnecessary for the models we care about here.
     megatron_cfg.tokenizer.trust_remote_code = True
     build_tokenizer(
         megatron_cfg.tokenizer,
