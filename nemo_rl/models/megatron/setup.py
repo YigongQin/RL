@@ -313,6 +313,22 @@ def validate_and_set_config(
     weights_path,
     optimizer_path,
 ):
+    # Enable Megatron batch-invariant kernels when the recipe sets
+    # megatron_cfg.batch_invariant_mode (Megatron-LM #6521 te_native backend).
+    megatron_cfg = config.get("megatron_cfg") or {}
+    if megatron_cfg.get("batch_invariant_mode"):
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            enable_batch_invariant_mode,
+        )
+
+        backend = megatron_cfg.get("batch_invariant_backend", "te_native")
+        enable_batch_invariant_mode(backend=backend)
+        print(
+            f"[batch_invariant_mode] enabled backend={backend!r} "
+            "(train + dedicated inference workers)",
+            flush=True,
+        )
+
     # Handle generation configuration
     is_generation_colocated = None
     sampling_params = None
@@ -836,6 +852,13 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
     model_cfg.moe_enable_routing_replay = router_replay_enabled(config)
 
+    if config["megatron_cfg"].get("batch_invariant_mode"):
+        model_cfg.batch_invariant_mode = True
+        if "batch_invariant_backend" in config["megatron_cfg"]:
+            model_cfg.batch_invariant_backend = config["megatron_cfg"][
+                "batch_invariant_backend"
+            ]
+
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Multi-Token Prediction settings onto the mcore model config."""
@@ -956,6 +979,33 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # These overrides need to be applied before the workers spawn.
     if "transformer_impl" in config["megatron_cfg"]:
         model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
+        # PATCH(PR-2/infopt-spec): Megatron-Bridge providers never map
+        # transformer_impl -> layer spec: GPTModelProvider.default_layer_spec branches
+        # only on use_transformer_engine_full_layer_spec (both branches TE), so
+        # "inference_optimized" silently builds TE modules and the whole fused
+        # inference stack (InferenceGroupedMLP, InferenceTopKRouter, inference
+        # dispatchers) is unreachable. Assign the inference-optimized GPT layer spec
+        # through the provider's documented override field (same hook the modelopt
+        # path uses). Callable form so it resolves against the FINAL provider fields
+        # at provide() time (after parallelism/MoE/precision overrides).
+        if model_cfg.transformer_impl == "inference_optimized":
+
+            def _inference_optimized_layer_spec(provider, vp_stage=None):
+                from megatron.core.models.gpt.gpt_layer_specs import (
+                    get_gpt_layer_with_inference_spec,
+                )
+
+                return get_gpt_layer_with_inference_spec(
+                    qk_layernorm=getattr(provider, "qk_layernorm", False),
+                    multi_latent_attention=getattr(
+                        provider, "multi_latent_attention", False
+                    ),
+                    qk_l2_norm=getattr(provider, "qk_l2_norm", False),
+                    num_experts=getattr(provider, "num_moe_experts", None),
+                    moe_grouped_gemm=getattr(provider, "moe_grouped_gemm", False),
+                )
+
+            model_cfg.transformer_layer_spec = _inference_optimized_layer_spec
     if "cuda_graph_impl" in config["megatron_cfg"]:
         model_cfg.cuda_graph_impl = config["megatron_cfg"]["cuda_graph_impl"]
         if model_cfg.cuda_graph_impl != "none":
