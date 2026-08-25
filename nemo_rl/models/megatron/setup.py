@@ -319,6 +319,7 @@ def validate_and_set_config(
     if megatron_cfg.get("batch_invariant_mode"):
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
             enable_batch_invariant_mode,
+            te_supports_batch_invariant_attention,
         )
 
         backend = megatron_cfg.get("batch_invariant_backend", "te_native")
@@ -328,6 +329,12 @@ def validate_and_set_config(
             "(train + dedicated inference workers)",
             flush=True,
         )
+        if not te_supports_batch_invariant_attention():
+            from nemo_rl.models.generation.megatron.zero_train_gen_kl_patches.core_patches import (
+                apply_te_bik_attention_assert_skip_patch,
+            )
+
+            apply_te_bik_attention_assert_skip_patch()
 
     # Handle generation configuration
     is_generation_colocated = None
@@ -858,6 +865,27 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
             model_cfg.batch_invariant_backend = config["megatron_cfg"][
                 "batch_invariant_backend"
             ]
+        # Megatron batch-invariant MoE requires the unfused permute/unpermute path
+        # (fixed-order combine via batch_invariant_unpermute, not fused scatter_add).
+        if model_cfg.moe_permute_fusion:
+            warnings.warn(
+                "batch_invariant_mode forces moe_permute_fusion=false for deterministic "
+                "MoE combine; overriding recipe value true.",
+                stacklevel=2,
+            )
+            model_cfg.moe_permute_fusion = False
+        pad_key = "moe_pad_experts_for_cuda_graph_inference"
+        pad_enabled = bool(
+            config["megatron_cfg"].get(pad_key)
+            or getattr(model_cfg, pad_key, False)
+        )
+        if pad_enabled:
+            warnings.warn(
+                "batch_invariant_mode forces moe_pad_experts_for_cuda_graph_inference=false "
+                "(dynamic dropless routing only); overriding recipe value true.",
+                stacklevel=2,
+            )
+            setattr(model_cfg, pad_key, False)
 
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -975,6 +1003,17 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 f"Invalid attention backend: {attention_backend}. "
                 f"Available backends are: {list(AttnBackend.__members__.keys())}"
             )
+
+    flash_attention_version = config["megatron_cfg"].get("flash_attention_version")
+    if flash_attention_version is not None:
+        model_cfg.flash_attention_version = flash_attention_version
+    elif config["megatron_cfg"].get("batch_invariant_mode"):
+        warnings.warn(
+            "batch_invariant_mode without flash_attention_version; defaulting to 4 "
+            "so train and inference use the same batch-invariant FlashAttention kernel.",
+            stacklevel=2,
+        )
+        model_cfg.flash_attention_version = 4
 
     # These overrides need to be applied before the workers spawn.
     if "transformer_impl" in config["megatron_cfg"]:

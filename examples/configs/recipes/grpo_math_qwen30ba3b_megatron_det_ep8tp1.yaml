@@ -1,7 +1,7 @@
 # Qwen3-30B-A3B — inference-optimized Megatron generation with batch-invariant mode.
 # Requires Megatron-LM main with #6521 (te_native batch-invariant backend).
 # Non-colocated: dedicated inference GPUs refit from the training policy via nvshmem.
-defaults: "grpo_math_1B_megatron.yaml"
+defaults: "../grpo_math_1B_megatron.yaml"
 
 grpo:
   num_prompts_per_step: 64
@@ -44,6 +44,7 @@ policy:
     batch_invariant_backend: te_native
     attention_backend: flash
     flash_attention_version: 4
+    moe_permute_fusion: false
     moe_pad_experts_for_cuda_graph_inference: true
 
     optimizer:
@@ -87,6 +88,8 @@ policy:
     mcore_generation_config:
       max_model_len: ${policy.max_total_sequence_length}
       transformer_impl: "inference_optimized"
+      # inference_optimized rejects fp64 router dtype (Megatron validate()).
+      moe_router_dtype: fp32
       logprobs_mode: raw_logprobs
       cuda_graph_impl: "local"
       inference_cuda_graph_scope: "block"

@@ -849,6 +849,31 @@ class TestApplyMoeConfig:
         assert "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN" not in os.environ
         assert "USE_MNNVL" not in os.environ
 
+    def test_batch_invariant_forces_deterministic_moe_combine(self):
+        """batch_invariant_mode disables fused permute and expert padding."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        model_cfg.moe_permute_fusion = True
+        model_cfg.moe_pad_experts_for_cuda_graph_inference = True
+        config = {
+            "megatron_cfg": {
+                **self._base_moe_megatron_cfg(),
+                "batch_invariant_mode": True,
+                "batch_invariant_backend": "te_native",
+                "moe_pad_experts_for_cuda_graph_inference": True,
+            }
+        }
+
+        with pytest.warns(UserWarning, match="moe_permute_fusion=false"):
+            with pytest.warns(UserWarning, match="moe_pad_experts_for_cuda_graph_inference=false"):
+                _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.batch_invariant_mode is True
+        assert model_cfg.batch_invariant_backend == "te_native"
+        assert model_cfg.moe_permute_fusion is False
+        assert model_cfg.moe_pad_experts_for_cuda_graph_inference is False
+
 
 @pytest.mark.mcore
 class TestApplyPrecisionConfig:
@@ -1044,6 +1069,31 @@ class TestApplyPerformanceConfig:
         _apply_performance_config(model_cfg, self._config())
 
         assert model_cfg.attention_backend is AttnBackend.flash
+
+    def test_flash_attention_version_from_yaml(self):
+        """flash_attention_version is forwarded to the mcore model config."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(gated_linear_unit=True)
+        config = self._config(attention_backend="flash")
+        config["megatron_cfg"]["flash_attention_version"] = 4
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.flash_attention_version == 4
+
+    def test_batch_invariant_defaults_flash_attention_version_to_four(self):
+        """batch_invariant_mode without FA version defaults to FA4."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(gated_linear_unit=True)
+        config = self._config(attention_backend="flash")
+        config["megatron_cfg"]["batch_invariant_mode"] = True
+
+        with pytest.warns(UserWarning, match="defaulting to 4"):
+            _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.flash_attention_version == 4
 
     def test_invalid_attention_backend_raises(self):
         """Invalid explicit backends retain the generic validation behavior."""

@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MCORE_DIR="${ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
 
-if [[ ! -d "${MCORE_DIR}/.git" ]]; then
+if ! git -C "${MCORE_DIR}" rev-parse --git-dir >/dev/null 2>&1; then
   echo "Missing ${MCORE_DIR}; run: git submodule update --init --recursive" >&2
   exit 1
 fi
