@@ -65,6 +65,8 @@ class MCoreGenerationSpecificArgs(TypedDict):
     kv_cache_management_mode: Literal["persist", "offload"]
 
     logging_step_interval: NotRequired[int]
+    # Dual-path CuteDSL W4A16 fused MoE on the dedicated generation model.
+    moe_cutedsl_w4a16: NotRequired[bool]
 
 
 class MCoreGenerationConfig(GenerationConfig):

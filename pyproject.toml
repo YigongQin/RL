@@ -205,9 +205,12 @@ mcore = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
   # Megatron batch_invariant_mode with MoE (Nano hybrid) requires DeepGEMM bf16 grouped GEMM.
   "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
-  "flashinfer-python==0.6.8.post1",
-  "flashinfer-cubin==0.6.8.post1",
-  "flashinfer-jit-cache==0.6.8.post1",
+  # CuteDSL W4A16 MoE (moe_cutedsl_w4a16) needs CuteDslMoEWrapper(quant_mode="w4a16").
+  # PyPI latest stable is 0.6.17 (W4A4 wrapper only). Pin the 0.6.18 nightly in
+  # lockstep; wheels come from the flashinfer-nightly indexes in [tool.uv.sources].
+  "flashinfer-python==0.6.18.dev20260819",
+  "flashinfer-cubin==0.6.18.dev20260819",
+  "flashinfer-jit-cache==0.6.18.dev20260819",
   "torch-memory-saver>=0.0.9.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
@@ -296,7 +299,12 @@ mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "a14b1dff
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
-flashinfer-jit-cache = { index = "flashinfer-cu130" }
+flashinfer-python = { index = "flashinfer-nightly", extra = "mcore" }
+flashinfer-cubin = { index = "flashinfer-nightly", extra = "mcore" }
+flashinfer-jit-cache = [
+  { index = "flashinfer-cu130" },
+  { index = "flashinfer-nightly-cu130", extra = "mcore" },
+]
 
 [tool.uv.workspace]
 members = [
@@ -322,6 +330,16 @@ explicit = true
 [[tool.uv.index]]
 name = "flashinfer-cu130"
 url = "https://flashinfer.ai/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-nightly"
+url = "https://flashinfer.ai/whl/nightly"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-nightly-cu130"
+url = "https://flashinfer.ai/whl/nightly/cu130"
 explicit = true
 
 [tool.uv]

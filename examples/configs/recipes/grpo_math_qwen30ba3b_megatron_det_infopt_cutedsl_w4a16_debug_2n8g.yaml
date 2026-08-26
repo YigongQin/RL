@@ -1,0 +1,12 @@
+# Qwen3-30B-A3B — infopt debug with CuteDSL W4A16 score/gen dual path.
+# Train backward stays TE BF16 grouped GEMM. Score + gen pack TE 1D NVFP4
+# weights into FlashInfer CuteDslMoEWrapper(quant_mode="w4a16").
+# Requires flashinfer-python>=0.6.18 + nvidia-cutlass-dsl on the mcore extra.
+defaults: "grpo_math_qwen30ba3b_megatron_det_infopt_debug_2n8g.yaml"
+
+policy:
+  megatron_cfg:
+    moe_cutedsl_w4a16: true
+  generation:
+    mcore_generation_config:
+      moe_cutedsl_w4a16: true

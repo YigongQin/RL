@@ -901,6 +901,30 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.inference_grouped_gemm_backend = config["megatron_cfg"][
             "inference_grouped_gemm_backend"
         ]
+    train_cutedsl = bool(config["megatron_cfg"].get("moe_cutedsl_w4a16"))
+    generation = config.get("generation") or {}
+    colocated = bool((generation.get("colocated") or {}).get("enabled"))
+    gen_cutedsl = bool(
+        (generation.get("mcore_generation_config") or {}).get("moe_cutedsl_w4a16")
+    )
+    if not colocated and train_cutedsl != gen_cutedsl:
+        raise ValueError(
+            "moe_cutedsl_w4a16 must be set on both policy.megatron_cfg and "
+            "policy.generation.mcore_generation_config so score and generate "
+            "share the CuteDSL W4A16 kernel."
+        )
+    if train_cutedsl:
+        if config["megatron_cfg"].get("fp4") or config["megatron_cfg"].get("fp4_param"):
+            raise ValueError(
+                "moe_cutedsl_w4a16 packs a W4A16 score/gen snapshot from BF16 masters; "
+                "do not enable megatron_cfg.fp4 / fp4_param (that switches TE compute)."
+            )
+        if not hasattr(model_cfg, "moe_cutedsl_w4a16"):
+            raise ValueError(
+                "moe_cutedsl_w4a16=True requires a Megatron-LM TransformerConfig that "
+                "declares moe_cutedsl_w4a16 (branch yigongq/infopt-cutedsl-w4a16)."
+            )
+        model_cfg.moe_cutedsl_w4a16 = True
     if "moe_router_num_groups" in config["megatron_cfg"]:
         model_cfg.moe_router_num_groups = config["megatron_cfg"][
             "moe_router_num_groups"
