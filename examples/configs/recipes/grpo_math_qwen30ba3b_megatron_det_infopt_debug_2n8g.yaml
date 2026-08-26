@@ -26,6 +26,9 @@ policy:
       # flake with driver OOM→null ptr→Triton crash (553728) despite free HBM.
       # Debug batches fit in max_model_len=2048; keep nvls (needed for zero-KL).
       max_tokens: 2048
+      # Temporary: nvshmem IB refit aborted on 554022 (transport retry exceeded).
+      # nccl avoids NVSHMEM for train↔gen weight sync; restore nvshmem later.
+      refit_backend: "nccl"
 
 logger:
   wandb_enabled: false
