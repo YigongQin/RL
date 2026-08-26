@@ -22,6 +22,10 @@ policy:
     mcore_generation_config:
       enable_chunked_prefill: false
       enable_prefix_caching: false
+      # EP NVLS symm buffers scale with max_tokens * EP. 16384 made multicast init
+      # flake with driver OOM→null ptr→Triton crash (553728) despite free HBM.
+      # Debug batches fit in max_model_len=2048; keep nvls (needed for zero-KL).
+      max_tokens: 2048
 
 logger:
   wandb_enabled: false
