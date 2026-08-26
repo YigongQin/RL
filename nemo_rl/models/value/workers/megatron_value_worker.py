@@ -63,6 +63,7 @@ from nemo_rl.models.megatron.data import (
     process_global_batch,
 )
 from nemo_rl.models.megatron.setup import (
+    enable_batch_invariant_mode,
     finalize_megatron_setup,
     handle_model_import,
     make_policy_like_config,
@@ -286,6 +287,10 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             init_optimizer: Whether to initialize the optimizer.
             worker_sharding_annotations: Sharding topology for distributed training.
         """
+        # te_native BI must arm before any CUDA/TE handle exists; otherwise
+        # cuBLASLt workspaces stay large and gen_kl stays nonzero.
+        enable_batch_invariant_mode(config)
+
         # Must be the first CUDA-touching call in this process.
         # With `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` (set by `configure_worker()`),
         gpu_ids = ray.get_gpu_ids()

@@ -41,7 +41,7 @@ from nemo_rl.algorithms.loss import (
     prepare_packed_loss_input,
     wrap_loss_fn_with_input_preparation,
 )
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -49,6 +49,7 @@ from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
+    get_next_token_logprobs_from_logits,
 )
 from nemo_rl.models.megatron.config import MegatronModule
 from nemo_rl.models.megatron.data import ProcessedMicrobatch
@@ -81,6 +82,7 @@ def model_forward(
     mtp_loss_mask: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     use_fused_linear_logprobs: bool = False,
+    gather_output: bool = False,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -97,6 +99,7 @@ def model_forward(
         straggler_timer: Straggler detector for profiling the forward pass
         use_fused_linear_logprobs: Whether to compute logprobs with the fused
             chunked linear cross-entropy kernel (directly from hidden states)
+        gather_output: Gather vocabulary-parallel logits on every TP rank.
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -123,6 +126,8 @@ def model_forward(
         # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
         # GPTModel.forward signatures do not accept it.
         additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
+    if gather_output:
+        additional_kwargs["runtime_gather_output"] = True
 
     # PATCH(golden score-checksum): timeline of which theta the train model holds.
     # Hashes a marker param (layer-0 router weight) on every forward; prints only on
@@ -403,6 +408,22 @@ def forward_with_post_processing_fn(
     mtp_loss_mask = processed_mb.mtp_loss_mask
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
 
+    # Megatron generation materializes the full vocabulary before its canonical
+    # FP32 log_softmax. Mirror that arithmetic for batch-invariant policy
+    # logprobs at any TP degree. Other consumers retain sharded logits.
+    megatron_cfg = post_processing_fn.cfg.get("megatron_cfg")
+    gather_output = bool(
+        megatron_cfg
+        and megatron_cfg.get("batch_invariant_mode")
+        and (
+            isinstance(post_processing_fn, LogprobsPostProcessor)
+            or (
+                isinstance(post_processing_fn, LossPostProcessor)
+                and post_processing_fn.loss_fn.input_type == LossInputType.LOGPROB
+            )
+        )
+    )
+
     if use_router_replay:
         if routed_experts_cp_sharded is None:
             raise RuntimeError(
@@ -425,6 +446,7 @@ def forward_with_post_processing_fn(
                 mtp_loss_mask=mtp_loss_mask,
                 straggler_timer=straggler_timer,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
+                gather_output=gather_output,
             )
     except Exception:
         # The forward above armed the router-replay action (set_router_replay_forward);
@@ -633,6 +655,18 @@ class LossPostProcessor:
         """
         # A custom prepare_fn (e.g. value models) overrides the default logit prep.
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
+        megatron_cfg = self.cfg.get("megatron_cfg")
+        full_vocab_logits = bool(
+            megatron_cfg
+            and megatron_cfg.get("batch_invariant_mode")
+            and self.loss_fn.input_type == LossInputType.LOGPROB
+        )
+        vocab_parallel_rank = (
+            None if full_vocab_logits else get_tensor_model_parallel_rank()
+        )
+        vocab_parallel_group = (
+            None if full_vocab_logits else get_tensor_model_parallel_group()
+        )
         if self.prepare_fn is not None:
             prepare_loss_input_wrapped = self.prepare_fn
         else:
@@ -671,8 +705,8 @@ class LossPostProcessor:
                 prepare_fn=prepare_fn,
                 cu_seqlens_q=packed_seq_params.cu_seqlens_q,
                 cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
-                vocab_parallel_rank=get_tensor_model_parallel_rank(),
-                vocab_parallel_group=get_tensor_model_parallel_group(),
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=get_context_parallel_group(),
             )
         else:
@@ -680,8 +714,8 @@ class LossPostProcessor:
                 wrap_loss_fn_with_input_preparation,
                 loss_fn=self.loss_fn,
                 prepare_fn=prepare_loss_input_wrapped,
-                vocab_parallel_rank=get_tensor_model_parallel_rank(),
-                vocab_parallel_group=get_tensor_model_parallel_group(),
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=get_context_parallel_group(),
             )
             if "student_logits" in data_dict:
@@ -690,8 +724,8 @@ class LossPostProcessor:
                     prepare_fn=prepare_loss_input_wrapped,
                     data_dict=data_dict,
                     loss_weight=float(self.cfg["draft"]["loss_weight"]),
-                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
-                    vocab_parallel_group=get_tensor_model_parallel_group(),
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
                     context_parallel_group=get_context_parallel_group(),
                 )
 
@@ -759,14 +793,20 @@ class LogprobsPostProcessor:
         """
         unpacked_input_ids = data_dict["input_ids"]
         original_seq_length = unpacked_input_ids.shape[1]
+        megatron_cfg = self.cfg.get("megatron_cfg")
+        full_vocab_logits = bool(
+            megatron_cfg and megatron_cfg.get("batch_invariant_mode")
+        )
 
         def processor_fn_inner(output_tensor):
             if self.use_fused_linear_logprobs:
                 token_logprobs = output_tensor.to(torch.float32)
                 token_logprobs = token_logprobs[:, : original_seq_length - 1]
             elif self.cfg["sequence_packing"]["enabled"]:
-                tp_grp = get_tensor_model_parallel_group()
-                tp_rank = get_tensor_model_parallel_rank()
+                tp_grp = (
+                    None if full_vocab_logits else get_tensor_model_parallel_group()
+                )
+                tp_rank = 0 if full_vocab_logits else get_tensor_model_parallel_rank()
                 logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
                 token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
                     output_tensor,
@@ -779,6 +819,12 @@ class LogprobsPostProcessor:
                     inference_only=True,
                     cp_group=get_context_parallel_group(),
                     chunk_size=logprob_chunk_size,
+                    sampling_params=self.sampling_params,
+                )
+            elif full_vocab_logits:
+                token_logprobs = get_next_token_logprobs_from_logits(
+                    input_ids=unpacked_input_ids,
+                    next_token_logits=output_tensor,
                     sampling_params=self.sampling_params,
                 )
             elif (

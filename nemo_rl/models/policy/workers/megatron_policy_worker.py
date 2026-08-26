@@ -70,6 +70,7 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 )
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.megatron.setup import (
+    enable_batch_invariant_mode,
     finalize_megatron_setup,
     handle_model_import,
     setup_distributed,
@@ -372,6 +373,10 @@ class MegatronPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        # te_native BI must arm before any CUDA/TE handle exists; otherwise
+        # cuBLASLt workspaces stay large and gen_kl stays nonzero.
+        enable_batch_invariant_mode(config)
+
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
         # not initialize a CUDA context ahead of the set_device below.
         log_gpu_memory_diagnostics(

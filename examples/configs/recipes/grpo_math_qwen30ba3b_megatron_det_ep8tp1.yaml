@@ -32,20 +32,26 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    tensor_model_parallel_size: 2
+    tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     context_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 8
-    sequence_parallel: True
+    sequence_parallel: False
     pipeline_dtype: ${policy.precision}
     # Megatron-LM #6521 batch-invariant stack (te_native GEMM + vLLM fused MoE in gen).
     batch_invariant_mode: true
     batch_invariant_backend: te_native
+    # #6634 training combine mirror matches this gen EP combine under BI.
+    # ordered: fixed rank-order fp32 Triton on both sides (default, portable).
+    # multimem: native NVLS RSV + fp64 training mirror (certified path).
+    batch_invariant_collective: ordered
     attention_backend: flash
     flash_attention_version: 4
     moe_permute_fusion: false
     moe_pad_experts_for_cuda_graph_inference: true
+    # Match gen (inference_optimized rejects fp64 router); train/gen must agree for zero KL.
+    moe_router_dtype: fp32
 
     optimizer:
       optimizer: "adam"
@@ -67,6 +73,10 @@ policy:
 
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      # Starve cuBLAS/cuBLASLt workspace before any GEMM (minf-onpolicy / te_native).
+      # Must live in Ray worker env_vars so handles are created starved (not after CUDA init).
+      CUBLAS_WORKSPACE_CONFIG: ":0:0"
+      CUBLASLT_WORKSPACE_SIZE: "0"
       # Train scoring uses the same float->log_softmax->gather path as generation (TP=1).
       NRL_FUSED_TRAIN_LOGPROB: "1"
       # Non-colocated refit: finish param gather before weight sync.

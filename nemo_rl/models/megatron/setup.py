@@ -220,6 +220,9 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.models.generation.megatron.config import (
+    merged_inference_megatron_cfg,
+)
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.config import ModelAndOptimizerState, RuntimeConfig
 from nemo_rl.models.megatron.draft.utils import (
@@ -240,6 +243,130 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.models.value.config import ValueConfig
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def enable_batch_invariant_mode(config: PolicyConfig) -> None:
+    """Enable Megatron-Core batch-invariant kernels before CUDA initialization.
+
+    The mode is deliberately limited to the topology for which Megatron
+    generation and policy scoring can execute the same arithmetic.
+    Megatron-Core performs the remaining model-specific validation when the
+    provider is finalized. Sampling parameters do not affect this validation:
+    generation samples from the processed distribution while generation and
+    policy scoring both report raw model logprobs.
+
+    Args:
+        config: Policy configuration for this Megatron worker.
+
+    Raises:
+        ValueError: If batch-invariant mode is requested with an unsupported
+            NeMo-RL topology, generation backend, or precision.
+        AssertionError: If the installed Transformer Engine cannot pin the
+            requested FlashAttention version.
+    """
+    megatron_cfg = config["megatron_cfg"]
+    if not megatron_cfg.get("batch_invariant_mode"):
+        return
+
+    required_fields = (
+        "batch_invariant_backend",
+        "batch_invariant_collective",
+        "flash_attention_version",
+    )
+    missing_fields = [field for field in required_fields if field not in megatron_cfg]
+    if missing_fields:
+        raise ValueError(
+            "batch_invariant_mode=True requires policy.megatron_cfg fields: "
+            f"{', '.join(missing_fields)}."
+        )
+
+    if config["precision"] != "bfloat16":
+        raise ValueError(
+            "batch_invariant_mode=True requires policy.precision='bfloat16'."
+        )
+    if megatron_cfg["context_parallel_size"] != 1:
+        raise ValueError(
+            "batch_invariant_mode=True currently requires training context "
+            "parallel size 1."
+        )
+    if megatron_cfg.get("use_fused_linear_logprobs"):
+        raise ValueError(
+            "batch_invariant_mode=True is incompatible with "
+            "use_fused_linear_logprobs=True because generation parity requires "
+            "the shared float-log_softmax-gather path."
+        )
+    if megatron_cfg.get("attention_backend") != "flash":
+        raise ValueError(
+            "batch_invariant_mode=True requires "
+            "policy.megatron_cfg.attention_backend='flash'."
+        )
+    if megatron_cfg["flash_attention_version"] not in (3, 4):
+        raise ValueError(
+            "batch_invariant_mode=True requires "
+            "policy.megatron_cfg.flash_attention_version to be 3 or 4."
+        )
+
+    generation_cfg = config.get("generation")
+    if generation_cfg is None or generation_cfg["backend"] != "megatron":
+        raise ValueError(
+            "batch_invariant_mode=True requires policy.generation.backend='megatron'."
+        )
+    inference_cfg = merged_inference_megatron_cfg(config)
+    matching_fields = (
+        "tensor_model_parallel_size",
+        "context_parallel_size",
+        "batch_invariant_mode",
+        "batch_invariant_backend",
+        "batch_invariant_collective",
+        "attention_backend",
+        "flash_attention_version",
+    )
+    mismatched_fields = [
+        field
+        for field in matching_fields
+        if inference_cfg[field] != megatron_cfg[field]
+    ]
+    if mismatched_fields:
+        raise ValueError(
+            "Training and generation must use the same Megatron settings for "
+            f"batch invariance: {', '.join(mismatched_fields)}."
+        )
+
+    # Pin (not setdefault): a preset large workspace makes te_native silently
+    # non-invariant on the aten GEMM path. Recipe env_vars should already set
+    # these via Ray before process start; re-pin here for local/dev entrypoints.
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":0:0"
+    os.environ["CUBLASLT_WORKSPACE_SIZE"] = "0"
+
+    # Keep optional Megatron GPU kernels out of imports when the mode is disabled.
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        enable_batch_invariant_mode as enable_mcore_batch_invariant_mode,
+        is_batch_invariant_mode_enabled,
+        te_supports_batch_invariant_attention,
+    )
+
+    already_on = is_batch_invariant_mode_enabled()
+    collective = megatron_cfg["batch_invariant_collective"]
+    backend = megatron_cfg["batch_invariant_backend"]
+    enable_mcore_batch_invariant_mode(backend=backend, collective=collective)
+    if not already_on:
+        cuda_state = (
+            "after CUDA init (handles may retain workspace)"
+            if torch.cuda.is_initialized()
+            else "before CUDA init"
+        )
+        print(
+            f"[batch_invariant_mode] enabled backend={backend!r} "
+            f"collective={collective!r} ({cuda_state}; "
+            "train + dedicated inference workers)",
+            flush=True,
+        )
+    if not te_supports_batch_invariant_attention():
+        from nemo_rl.models.generation.megatron.zero_train_gen_kl_patches.core_patches import (
+            apply_te_bik_attention_assert_skip_patch,
+        )
+
+        apply_te_bik_attention_assert_skip_patch()
 
 
 def destroy_parallel_state():
@@ -313,28 +440,9 @@ def validate_and_set_config(
     weights_path,
     optimizer_path,
 ):
-    # Enable Megatron batch-invariant kernels when the recipe sets
-    # megatron_cfg.batch_invariant_mode (Megatron-LM #6521 te_native backend).
-    megatron_cfg = config.get("megatron_cfg") or {}
-    if megatron_cfg.get("batch_invariant_mode"):
-        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-            enable_batch_invariant_mode,
-            te_supports_batch_invariant_attention,
-        )
-
-        backend = megatron_cfg.get("batch_invariant_backend", "te_native")
-        enable_batch_invariant_mode(backend=backend)
-        print(
-            f"[batch_invariant_mode] enabled backend={backend!r} "
-            "(train + dedicated inference workers)",
-            flush=True,
-        )
-        if not te_supports_batch_invariant_attention():
-            from nemo_rl.models.generation.megatron.zero_train_gen_kl_patches.core_patches import (
-                apply_te_bik_attention_assert_skip_patch,
-            )
-
-            apply_te_bik_attention_assert_skip_patch()
+    # Backstop if a caller skipped the early worker-init hook. Prefer calling
+    # enable_batch_invariant_mode() before torch.cuda.set_device.
+    enable_batch_invariant_mode(config)
 
     # Handle generation configuration
     is_generation_colocated = None
@@ -343,12 +451,15 @@ def validate_and_set_config(
         generation_cfg = config["generation"]
         # set generation colocated
         is_generation_colocated = generation_cfg["colocated"]["enabled"]
-        # set sampling params
-        sampling_params = TrainingSamplingParams(
-            top_k=generation_cfg["top_k"],
-            top_p=generation_cfg["top_p"],
-            temperature=generation_cfg["temperature"],
-        )
+        # Batch-invariant Megatron inference returns raw model logprobs even
+        # when token sampling uses temperature, top-k, or top-p. Match
+        # Megatron-RL by recomputing raw training logprobs as well.
+        if not config["megatron_cfg"].get("batch_invariant_mode"):
+            sampling_params = TrainingSamplingParams(
+                top_k=generation_cfg["top_k"],
+                top_p=generation_cfg["top_p"],
+                temperature=generation_cfg["temperature"],
+            )
 
     # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
     # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
@@ -864,6 +975,10 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         if "batch_invariant_backend" in config["megatron_cfg"]:
             model_cfg.batch_invariant_backend = config["megatron_cfg"][
                 "batch_invariant_backend"
+            ]
+        if "batch_invariant_collective" in config["megatron_cfg"]:
+            model_cfg.batch_invariant_collective = config["megatron_cfg"][
+                "batch_invariant_collective"
             ]
         # Megatron batch-invariant MoE requires the unfused permute/unpermute path
         # (fixed-order combine via batch_invariant_unpermute, not fused scatter_add).
