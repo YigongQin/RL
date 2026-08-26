@@ -299,10 +299,13 @@ mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "a14b1dff
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
+# One index per extra. A catch-all cu130 source plus a mcore nightly source
+# makes uv see two indexes for jit-cache in the same lock split.
 flashinfer-python = { index = "flashinfer-nightly", extra = "mcore" }
 flashinfer-cubin = { index = "flashinfer-nightly", extra = "mcore" }
 flashinfer-jit-cache = [
-  { index = "flashinfer-cu130" },
+  { index = "flashinfer-cu130", extra = "vllm" },
+  { index = "flashinfer-cu130", extra = "sglang" },
   { index = "flashinfer-nightly-cu130", extra = "mcore" },
 ]
 
