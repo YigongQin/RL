@@ -193,6 +193,43 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     return paths[0]
 
 
+# CUTLASS get_prefix_dsl_libs() returns this env var immediately when set,
+# skipping __file__ discovery. A driver/container value points at
+# /opt/nemo_rl_venv, which remote nodes often do not have.
+CUTE_DSL_LIBS_ENV = "CUTE_DSL_LIBS"
+
+
+def resolve_cute_dsl_libs(py_executable: str) -> str | None:
+    """Return ``libcute_dsl_runtime.so`` under ``py_executable``'s venv, if present.
+
+    ``py_executable`` is the worker interpreter (``.../bin/python``), not a
+    ``uv run ...`` command. Walks ``lib/python*/site-packages`` without
+    resolving the interpreter symlink, matching
+    ``os.path.dirname(os.path.dirname(py_executable))``.
+    """
+    venv_root = Path(py_executable).parent.parent
+    matches = sorted(
+        venv_root.glob(
+            "lib/python*/site-packages/nvidia_cutlass_dsl/*/lib/libcute_dsl_runtime.so"
+        )
+    )
+    if not matches:
+        return None
+    return str(matches[0])
+
+
+def apply_cute_dsl_libs_env(env_vars: dict[str, str], py_executable: str) -> None:
+    """Pin ``CUTE_DSL_LIBS`` to the worker venv, or blank it to block inheritance.
+
+    Always writes the key. Ray merges job/raylet env vars with the actor
+    ``runtime_env``; omitting the key leaves a driver-local path in place.
+    An empty value is falsy in CUTLASS ``get_prefix_dsl_libs()``, which
+    then discovers the ``.so`` from the worker's own ``__file__``.
+    """
+    libs = resolve_cute_dsl_libs(py_executable)
+    env_vars[CUTE_DSL_LIBS_ENV] = libs if libs is not None else ""
+
+
 def make_actor_runtime_env(actor_class_fqn: str) -> dict:
     """Build a Ray ``runtime_env`` for one of our registered actors.
 
@@ -215,11 +252,13 @@ def make_actor_runtime_env(actor_class_fqn: str) -> dict:
     if py_exec.startswith("uv"):
         py_exec = create_local_venv_on_each_node(py_exec, actor_class_fqn)
     venv = os.path.dirname(os.path.dirname(py_exec))  # strip bin/python
+    env_vars = {
+        **os.environ,
+        "VIRTUAL_ENV": venv,
+        "UV_PROJECT_ENVIRONMENT": venv,
+    }
+    apply_cute_dsl_libs_env(env_vars, py_exec)
     return {
         "py_executable": py_exec,
-        "env_vars": {
-            **os.environ,
-            "VIRTUAL_ENV": venv,
-            "UV_PROJECT_ENVIRONMENT": venv,
-        },
+        "env_vars": env_vars,
     }

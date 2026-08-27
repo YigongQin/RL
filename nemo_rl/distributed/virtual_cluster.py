@@ -261,6 +261,11 @@ def init_ray(log_dir: Optional[str] = None) -> None:
 
     env_vars = dict(os.environ)
     env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
+    # CUTLASS treats CUTE_DSL_LIBS as authoritative. A driver/container
+    # value points at /opt/nemo_rl_venv and is missing on remote nodes.
+    # Workers pin the worker-venv path in RayWorkerGroup; drop the job
+    # default so IsolatedWorkerInitializer cannot inherit it.
+    env_vars.pop("CUTE_DSL_LIBS", None)
 
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables

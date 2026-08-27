@@ -75,6 +75,13 @@ _patch_mcore_venv_fla() {
 
 _patch_mcore_venv_fla
 
+# batch_invariant_mode imports megatron.core on the driver. Sync mcore deps
+# into /opt/nemo_rl_venv so that import succeeds. Worker CUTE_DSL_LIBS is
+# pinned in RayWorkerGroup; do not export a driver-local path.
+uv sync --extra mcore --locked
+/opt/nemo_rl_venv/bin/python -c \
+    'import cutlass.cute; print("[driver] cutlass.cute OK")'
+
 read -r -a extra_args <<< "${NRL_HARNESS_EXTRA_ARGS:-}"
 
 exec uv run --no-sync --extra mcore examples/gen_kl_harness.py \

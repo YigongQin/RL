@@ -16,7 +16,12 @@ import subprocess
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from nemo_rl.utils.venvs import create_local_venv
+from nemo_rl.utils.venvs import (
+    CUTE_DSL_LIBS_ENV,
+    apply_cute_dsl_libs_env,
+    create_local_venv,
+    resolve_cute_dsl_libs,
+)
 from tests.unit.conftest import TEST_ASSETS_DIR
 
 
@@ -48,3 +53,72 @@ def test_create_local_venv():
             # Verify the command executed successfully (return code 0)
             assert result.returncode == 0, f"Failed to import sphinx: {result.stderr}"
             assert "Sphinx package is installed" in result.stdout
+
+
+def test_resolve_cute_dsl_libs_finds_so(tmp_path):
+    py_executable = tmp_path / "bin" / "python"
+    py_executable.parent.mkdir(parents=True)
+    py_executable.touch()
+    so_path = (
+        tmp_path
+        / "lib"
+        / "python3.13"
+        / "site-packages"
+        / "nvidia_cutlass_dsl"
+        / "cu12"
+        / "lib"
+        / "libcute_dsl_runtime.so"
+    )
+    so_path.parent.mkdir(parents=True)
+    so_path.touch()
+
+    assert resolve_cute_dsl_libs(str(py_executable)) == str(so_path)
+
+
+def test_resolve_cute_dsl_libs_missing(tmp_path):
+    py_executable = tmp_path / "bin" / "python"
+    py_executable.parent.mkdir(parents=True)
+    py_executable.touch()
+
+    assert resolve_cute_dsl_libs(str(py_executable)) is None
+
+
+def test_apply_cute_dsl_libs_env_clobbers_driver_path(tmp_path):
+    py_executable = tmp_path / "bin" / "python"
+    py_executable.parent.mkdir(parents=True)
+    py_executable.touch()
+    so_path = (
+        tmp_path
+        / "lib"
+        / "python3.13"
+        / "site-packages"
+        / "nvidia_cutlass_dsl"
+        / "cu12"
+        / "lib"
+        / "libcute_dsl_runtime.so"
+    )
+    so_path.parent.mkdir(parents=True)
+    so_path.touch()
+
+    driver_path = (
+        "/opt/nemo_rl_venv/lib/python3.13/site-packages/"
+        "nvidia_cutlass_dsl/cu12/lib/libcute_dsl_runtime.so"
+    )
+    env_vars = {CUTE_DSL_LIBS_ENV: driver_path}
+    apply_cute_dsl_libs_env(env_vars, str(py_executable))
+    assert env_vars[CUTE_DSL_LIBS_ENV] == str(so_path)
+
+
+def test_apply_cute_dsl_libs_env_blanks_when_missing(tmp_path):
+    py_executable = tmp_path / "bin" / "python"
+    py_executable.parent.mkdir(parents=True)
+    py_executable.touch()
+
+    env_vars = {
+        CUTE_DSL_LIBS_ENV: (
+            "/opt/nemo_rl_venv/lib/python3.13/site-packages/"
+            "nvidia_cutlass_dsl/cu12/lib/libcute_dsl_runtime.so"
+        )
+    }
+    apply_cute_dsl_libs_env(env_vars, str(py_executable))
+    assert env_vars[CUTE_DSL_LIBS_ENV] == ""

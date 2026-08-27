@@ -12,9 +12,11 @@
 
 # Cheap gen_kl_error gate — one rollout + train-path get_logprobs, no GRPO training loop.
 #
-# MODEL=infopt-debug-1n|infopt-debug-2n|infopt|qwen1.5b|qwen30ba3b
+# MODEL=infopt-debug-1n|infopt-debug-2n|infopt-cutedsl-1n|infopt-cutedsl-2n|infopt|qwen1.5b|qwen30ba3b
 #   infopt-debug-1n  (default) 1 node, Qwen1.5B, 4 train + 4 inference GPUs
 #   infopt-debug-2n            2 nodes, Qwen30B MoE, 1 train + 1 inference node
+#   infopt-cutedsl-1n          1 node, Qwen30B CuteDSL W4A16, shared GPUs (B200)
+#   infopt-cutedsl-2n          2 nodes, Qwen30B CuteDSL W4A16, 1 train + 1 infer
 #   infopt                     8 nodes, production #3531 repro
 #   qwen1.5b|qwen30ba3b         colocated zero_train_gen_mismatch (yigongq/minf-onpolicy branch only)
 #
@@ -48,6 +50,17 @@ case "${MODEL}" in
     infopt-debug-2n|debug-2n)
         RUN_PREFIX="infopt-debug-2n"
         HARNESS_CONFIG="examples/configs/recipes/grpo_math_qwen30ba3b_megatron_det_infopt_debug_2n8g.yaml"
+        NUM_NODES="${NUM_NODES:-2}"
+        ;;
+    infopt-cutedsl-1n|cutedsl-1n)
+        RUN_PREFIX="infopt-cutedsl-1n"
+        HARNESS_CONFIG="examples/configs/recipes/grpo_math_qwen30ba3b_megatron_det_infopt_cutedsl_w4a16_debug_1n8g.yaml"
+        NUM_NODES="${NUM_NODES:-1}"
+        export NRL_MINF_SHARED_CLUSTER="${NRL_MINF_SHARED_CLUSTER:-1}"
+        ;;
+    infopt-cutedsl-2n|cutedsl-2n)
+        RUN_PREFIX="infopt-cutedsl-2n"
+        HARNESS_CONFIG="examples/configs/recipes/grpo_math_qwen30ba3b_megatron_det_infopt_cutedsl_w4a16_debug_2n8g.yaml"
         NUM_NODES="${NUM_NODES:-2}"
         ;;
     infopt-shared-1n)
@@ -87,7 +100,7 @@ case "${MODEL}" in
         EXTRA_FLAGS+=("policy.max_total_sequence_length=${ISL}")
         ;;
     *)
-        echo "ERROR: MODEL must be infopt-debug-1n, infopt-debug-2n, infopt-shared-1n, infopt, qwen1.5b, or qwen30ba3b." >&2
+        echo "ERROR: MODEL must be infopt-debug-1n, infopt-debug-2n, infopt-cutedsl-1n, infopt-cutedsl-2n, infopt-shared-1n, infopt, qwen1.5b, or qwen30ba3b." >&2
         exit 1
         ;;
 esac

@@ -24,6 +24,8 @@
 # MODEL (inference-optimized / #3531 stack — dedicated infer nodes, BI + te_native):
 #   infopt-debug-1n   1 node, Qwen1.5B, 4 train + 4 inference GPUs
 #   infopt-debug-2n   2 nodes, Qwen30B MoE (submit with -N 2)
+#   infopt-cutedsl-1n 1 node, Qwen30B MoE + CuteDSL W4A16, shared GPUs (B200)
+#   infopt-cutedsl-2n 2 nodes, Qwen30B MoE + CuteDSL W4A16 score/gen (submit with -N 2)
 #   infopt-shared-1n  1 node shared-GPU path for 30B (sets NRL_MINF_SHARED_CLUSTER=1)
 #   infopt            8 nodes, production det_ep8tp1 recipe (submit with -N 8)
 #   MAX_STEPS=1       cheap step-0 gen_kl gate (default remains 2000 for long runs)
@@ -91,6 +93,21 @@ case "${MODEL}" in
         SAVE_PERIOD="${SAVE_PERIOD:-10}"
         DEFAULT_NODES=2
         ;;
+    infopt-cutedsl-1n|cutedsl-1n)
+        STACK="infopt"
+        RUN_PREFIX="infopt-cutedsl-1n"
+        GRPO_CONFIG="examples/configs/recipes/grpo_math_qwen30ba3b_megatron_det_infopt_cutedsl_w4a16_debug_1n8g.yaml"
+        SAVE_PERIOD="${SAVE_PERIOD:-10}"
+        DEFAULT_NODES=1
+        export NRL_MINF_SHARED_CLUSTER="${NRL_MINF_SHARED_CLUSTER:-1}"
+        ;;
+    infopt-cutedsl-2n|cutedsl-2n)
+        STACK="infopt"
+        RUN_PREFIX="infopt-cutedsl-2n"
+        GRPO_CONFIG="examples/configs/recipes/grpo_math_qwen30ba3b_megatron_det_infopt_cutedsl_w4a16_debug_2n8g.yaml"
+        SAVE_PERIOD="${SAVE_PERIOD:-10}"
+        DEFAULT_NODES=2
+        ;;
     infopt-shared-1n)
         STACK="infopt"
         RUN_PREFIX="infopt-shared-1n"
@@ -114,7 +131,7 @@ case "${MODEL}" in
     *)
         echo "ERROR: MODEL is required." >&2
         echo "  colocated: qwen1.5b, qwen30ba3b, nanov3" >&2
-        echo "  infopt:    infopt-debug-1n, infopt-debug-2n, infopt-shared-1n, infopt" >&2
+        echo "  infopt:    infopt-debug-1n, infopt-debug-2n, infopt-cutedsl-1n, infopt-cutedsl-2n, infopt-shared-1n, infopt" >&2
         exit 1
         ;;
 esac
@@ -222,8 +239,15 @@ uv run --no-sync --extra mcore python research/megatron-inference-true-on-policy
 # Non-colocated infopt recipes use refit_backend=nvshmem; Megatron's copy
 # service hard-requires NVSHMEM_MAX_CTAS=2 (hangs/fails otherwise).
 NVSHMEM_EXPORT=""
+DRIVER_MCORE_SYNC=""
 if [[ "${STACK}" == "infopt" ]]; then
     NVSHMEM_EXPORT="export NVSHMEM_MAX_CTAS=2 && "
+    # batch_invariant_mode imports megatron.core on the Ray driver (lm_policy.py).
+    # Sync mcore deps into /opt/nemo_rl_venv so that import succeeds. Worker
+    # CUTE_DSL_LIBS is pinned in RayWorkerGroup from the worker venv; do not
+    # export a driver-local path here (remote nodes do not have it).
+    DRIVER_MCORE_SYNC="uv sync --extra mcore --locked && \
+/opt/nemo_rl_venv/bin/python -c 'import cutlass.cute; print(\"[driver] cutlass.cute OK\")' && "
 fi
 
 export COMMAND="${CACHE_EXPORT}\
@@ -243,6 +267,7 @@ export FLA_TILELANG=0 FLA_DISABLE_BACKEND_DISPATCH=1 && \
 ${MCORE_FLA_SETUP}\
 unset NRL_FORCE_REBUILD_VENVS && \
 cd /opt/nemo-rl && \
+${DRIVER_MCORE_SYNC}\
 ${UV_RUN[*]} examples/run_grpo.py ${GRPO_ARGS[*]}"
 
 echo "MODEL=${RUN_PREFIX} STACK=${STACK} CONFIG=${GRPO_CONFIG}"

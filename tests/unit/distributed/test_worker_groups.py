@@ -26,6 +26,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.utils.venvs import CUTE_DSL_LIBS_ENV
 
 
 @ray.remote
@@ -485,6 +486,38 @@ def test_custom_environment_variables_override_existing(
     )
 
     worker_group.shutdown(force=True)
+
+
+def test_cute_dsl_libs_not_inherited_from_driver(register_test_actor, virtual_cluster):
+    """Workers must not inherit a driver/container CUTE_DSL_LIBS path."""
+    driver_path = (
+        "/opt/nemo_rl_venv/lib/python3.13/site-packages/"
+        "nvidia_cutlass_dsl/cu12/lib/libcute_dsl_runtime.so"
+    )
+    original = os.environ.get(CUTE_DSL_LIBS_ENV)
+    os.environ[CUTE_DSL_LIBS_ENV] = driver_path
+    worker_group = None
+    try:
+        builder = RayWorkerBuilder(register_test_actor)
+        worker_group = RayWorkerGroup(
+            cluster=virtual_cluster,
+            remote_worker_builder=builder,
+            workers_per_node=1,
+        )
+        actual = ray.get(worker_group.workers[0].get_env_var.remote(CUTE_DSL_LIBS_ENV))
+        assert actual != driver_path
+        if actual:
+            assert actual.endswith("libcute_dsl_runtime.so")
+            assert "/opt/nemo_rl_venv/" not in actual
+        else:
+            assert actual == ""
+    finally:
+        if worker_group is not None:
+            worker_group.shutdown(force=True)
+        if original is None:
+            os.environ.pop(CUTE_DSL_LIBS_ENV, None)
+        else:
+            os.environ[CUTE_DSL_LIBS_ENV] = original
 
 
 def test_configure_worker_interaction(register_test_actor, virtual_cluster):

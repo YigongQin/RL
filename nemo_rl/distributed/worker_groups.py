@@ -31,6 +31,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_group_utils import recursive_merge_options
 from nemo_rl.utils.venvs import (
+    apply_cute_dsl_libs_env,
     create_local_venv_on_each_node,
 )
 
@@ -259,6 +260,12 @@ class RayWorkerBuilder:
         """
         # Set up worker arguments and resources
         options = deepcopy(extra_options)
+        runtime_env = options.get("runtime_env") or {}
+        py_executable = runtime_env.get("py_executable")
+        if py_executable:
+            env_vars = runtime_env.setdefault("env_vars", {})
+            apply_cute_dsl_libs_env(env_vars, py_executable)
+            options["runtime_env"] = runtime_env
         initializer_options = {"runtime_env": options["runtime_env"]}
         isolated_initializer = self.IsolatedWorkerInitializer.options(  # type: ignore # @ray.remote call
             **initializer_options
@@ -493,12 +500,22 @@ class RayWorkerGroup:
         available_ports = [port for _, port in addr_port_results]
 
         # Pool one IsolatedWorkerInitializer per unique pg_idx instead of one
-        # per worker. All workers on a node share the same py_executable, so
-        # the initializer only needs that in its runtime_env — per-worker
-        # env_vars are passed through create_worker(). This reduces GCS actor
+        # per worker. All workers on a node share the same py_executable.
+        # Per-worker env_vars (RANK, etc.) still go through create_worker();
+        # CUTE_DSL_LIBS is pinned on the initializer too so nested actors
+        # cannot inherit a driver-local path. This reduces GCS actor
         # registrations from N_workers to N_nodes.
         unique_pg_indices = sorted({pg_idx for pg_idx, _ in bundle_indices_list})
-        initializer_runtime_env = {"py_executable": py_executable}
+        # IsolatedWorkerInitializer imports the worker module (and thus
+        # CUTLASS) with only py_executable unless env_vars are set. Pin
+        # CUTE_DSL_LIBS here so job/raylet driver-venv paths cannot leak
+        # into nested MegatronPolicyWorker actors.
+        initializer_env_vars: dict[str, str] = {}
+        apply_cute_dsl_libs_env(initializer_env_vars, py_executable)
+        initializer_runtime_env = {
+            "py_executable": py_executable,
+            "env_vars": initializer_env_vars,
+        }
         self._initializer_pool: dict[int, ray.actor.ActorHandle] = {}
         for pg_idx in unique_pg_indices:
             # num_cpus=0 so the initializer doesn't consume a CPU slot — it
@@ -578,6 +595,7 @@ class RayWorkerGroup:
                 )  # to remove the "bin/python" suffix
                 runtime_env["env_vars"]["VIRTUAL_ENV"] = py_venv
                 runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_venv
+                apply_cute_dsl_libs_env(runtime_env["env_vars"], py_executable)
 
                 extra_options = {"runtime_env": runtime_env, "name": name}
 
