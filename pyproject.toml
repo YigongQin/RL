@@ -192,7 +192,8 @@ mcore = [
   # 0.6.18 nightly requires ==4.7.0; override-dependencies unifies on 4.7.0.
   "flash-attn-4>=4.0.0b20 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # uv mcore extra fork omits flash-attn-4 transitive deps; pin explicitly for worker venvs.
-  # Bare nvidia-cutlass-dsl is a stub wheel; libs-base is excluded project-wide (see exclude-dependencies).
+  # Bare nvidia-cutlass-dsl is a stub wheel; its platform wheel dependencies
+  # provide the cutlass.cute implementation.
   "nvidia-cutlass-dsl[cu13]==4.7.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # flash-attn-4 4.0.0b25 needs >=0.1.12 for map_dataclass_to_tuple in cute.compile.
   "apache-tvm-ffi>=0.1.12,<0.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
@@ -469,11 +470,6 @@ constraint-dependencies = [
   "av>=17.1.0",                               # Address CVE-2026-40962 (FFmpeg 8.0.1 bundled in av.libs; 17.1.0+ ships FFmpeg 8.1.x)
   "opencv-python-headless>=5.0.0",            # CVE floor: patches CVE-2025-9951, CVE-2025-1594, CVE-2024-31582 (bundled FFmpeg 5.1.6 in 4.x)
 ]
-
-# Workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base
-# and libs-cu13 wheels overlap and race on shared paths. libs-cu13 is a
-# functional superset at 4.5.2, so drop libs-base to make installs deterministic.
-exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
 
 conflicts = [
   [
