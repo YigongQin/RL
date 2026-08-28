@@ -115,11 +115,7 @@ case "${MODEL}" in
         SAVE_PERIOD="${SAVE_PERIOD:-10}"
         DEFAULT_NODES=1
         export NRL_MINF_SHARED_CLUSTER="${NRL_MINF_SHARED_CLUSTER:-1}"
-        EXTRA_FLAGS+=(
-            "grpo.num_prompts_per_step=2"
-            "grpo.num_generations_per_prompt=2"
-            "policy.train_global_batch_size=4"
-        )
+        # Keep 2n GBS=8 (2×4). TP1 on 8 GPUs is DP=8; GBS must be divisible by DP.
         ;;
     infopt|infopt-qwen30ba3b)
         STACK="infopt"
@@ -232,7 +228,7 @@ fi
 # initial patch so Ray _env_builder reuses the patched venv instead of rebuilding.
 MCORE_FLA_SETUP="export FLA_TILELANG=0 FLA_DISABLE_BACKEND_DISPATCH=1 ZERO_KL_MODEL_PREFIX=${RUN_PREFIX} && \
 cd /opt/nemo-rl && \
-uv run --extra mcore python research/megatron-inference-true-on-policy/patch_mcore_venv_fla.py && \
+uv run --no-sync --extra mcore python research/megatron-inference-true-on-policy/patch_mcore_venv_fla.py && \
 unset NRL_FORCE_REBUILD_VENVS && \
 uv run --no-sync --extra mcore python research/megatron-inference-true-on-policy/patch_mcore_venv_fla.py --post-sync && "
 

@@ -1,0 +1,13 @@
+# Qwen3-30B-A3B — CuteDSL W4A16 on 1 node (shared train+gen GPUs).
+# Launch with MODEL=infopt-cutedsl-1n (sets NRL_MINF_SHARED_CLUSTER=1).
+# Train + dedicated-gen co-schedule on the same 8 GPUs (fractional workers).
+# Needs ~180GB/GPU (B200). OOM → MODEL=infopt-cutedsl-2n.
+#
+# Keep train_global_batch_size=8 from the 2n parent (2 prompts × 4 gens).
+# TP1/PP1/CP1 on 8 GPUs → DP=8; EP=8 is overlaid on DP and does not shrink it.
+# Bridge requires GBS % (MBS × DP) == 0, so GBS=4 fails validate().
+defaults: "grpo_math_qwen30ba3b_megatron_det_infopt_cutedsl_w4a16_debug_2n8g.yaml"
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

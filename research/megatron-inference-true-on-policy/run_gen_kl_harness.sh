@@ -68,11 +68,7 @@ case "${MODEL}" in
         HARNESS_CONFIG="examples/configs/recipes/grpo_math_qwen30ba3b_megatron_det_infopt_debug_2n8g.yaml"
         NUM_NODES="${NUM_NODES:-1}"
         export NRL_MINF_SHARED_CLUSTER="${NRL_MINF_SHARED_CLUSTER:-1}"
-        EXTRA_FLAGS+=(
-            "grpo.num_prompts_per_step=2"
-            "grpo.num_generations_per_prompt=2"
-            "policy.train_global_batch_size=4"
-        )
+        # Keep 2n GBS=8 (2×4). TP1 on 8 GPUs is DP=8; GBS must be divisible by DP.
         ;;
     infopt|infopt-qwen30ba3b)
         RUN_PREFIX="infopt-qwen30ba3b"
