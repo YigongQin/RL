@@ -395,6 +395,11 @@ class MegatronConfig(TypedDict):
     # Backend for grouped-GEMM during inference-optimized MoE forward.
     # Options: 'flashinfer', 'torch', 'vllm' (mcore default).
     inference_grouped_gemm_backend: NotRequired[str]
+    # Dual-path W4A16 fused MoE: score/gen use FlashInfer CuteDSL NVFP4 weights
+    # with BF16 activations; train backward stays TE BF16 grouped GEMM.
+    # Pack uses TE's 1D NVFP4 quant kernel (not ModelOpt, not TE fp4 compute).
+    # Requires flashinfer-python>=0.6.18. Default false; set in exemplar YAML.
+    moe_cutedsl_w4a16: NotRequired[bool]
     # InferenceTopKRouter requires moe_router_num_groups=None
     # (used when transformer_impl='inference_optimized')
     moe_router_num_groups: NotRequired[int | None]

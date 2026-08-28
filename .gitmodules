@@ -1,8 +1,8 @@
 [submodule "3rdparty/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
-	url = git@github.com:YigongQin/Megatron-Bridge.git
-	branch = main
-	shallow = true
+	url = https://github.com/YigongQin/Megatron-Bridge.git
+	branch = yigongq/infopt-cutedsl-w4a16
+	fetchRecurseSubmodules = false
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
 	url = https://github.com/NVIDIA-NeMo/Automodel.git

@@ -188,11 +188,13 @@ mcore = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   # TE v2.15 Megatron attention_backend=flash requires flash_attn.cute (FA4).
-  # flash-attn-4 pulls nvidia-cutlass-dsl==4.6.0.dev0; [cu13] installs libs-cu13 (the `cutlass` module).
+  # flash-attn-4 4.0.0b26 pins nvidia-cutlass-dsl==4.6.0.dev0, but flashinfer
+  # 0.6.18 nightly requires ==4.7.0; override-dependencies unifies on 4.7.0.
   "flash-attn-4>=4.0.0b20 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # uv mcore extra fork omits flash-attn-4 transitive deps; pin explicitly for worker venvs.
-  # Bare nvidia-cutlass-dsl is a stub wheel; libs-base is excluded project-wide (see exclude-dependencies).
-  "nvidia-cutlass-dsl[cu13]==4.6.0.dev0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # Bare nvidia-cutlass-dsl is a stub wheel; its platform wheel dependencies
+  # provide the cutlass.cute implementation.
+  "nvidia-cutlass-dsl[cu13]==4.7.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # flash-attn-4 4.0.0b25 needs >=0.1.12 for map_dataclass_to_tuple in cute.compile.
   "apache-tvm-ffi>=0.1.12,<0.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # mamba-ssm/causal-conv1d LOOK redundant (megatron-bridge[ssm] pulls them), but do not
@@ -205,9 +207,12 @@ mcore = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
   # Megatron batch_invariant_mode with MoE (Nano hybrid) requires DeepGEMM bf16 grouped GEMM.
   "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
-  "flashinfer-python==0.6.8.post1",
-  "flashinfer-cubin==0.6.8.post1",
-  "flashinfer-jit-cache==0.6.8.post1",
+  # CuteDSL W4A16 MoE (moe_cutedsl_w4a16) needs CuteDslMoEWrapper(quant_mode="w4a16").
+  # PyPI latest stable is 0.6.17 (W4A4 wrapper only). Pin the 0.6.18 nightly in
+  # lockstep; wheels come from the flashinfer-nightly indexes in [tool.uv.sources].
+  "flashinfer-python==0.6.18.dev20260819",
+  "flashinfer-cubin==0.6.18.dev20260819",
+  "flashinfer-jit-cache==0.6.18.dev20260819",
   "torch-memory-saver>=0.0.9.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
@@ -296,7 +301,15 @@ mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "a14b1dff
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
-flashinfer-jit-cache = { index = "flashinfer-cu130" }
+# One index per extra. A catch-all cu130 source plus a mcore nightly source
+# makes uv see two indexes for jit-cache in the same lock split.
+flashinfer-python = { index = "flashinfer-nightly", extra = "mcore" }
+flashinfer-cubin = { index = "flashinfer-nightly", extra = "mcore" }
+flashinfer-jit-cache = [
+  { index = "flashinfer-cu130", extra = "vllm" },
+  { index = "flashinfer-cu130", extra = "sglang" },
+  { index = "flashinfer-nightly-cu130", extra = "mcore" },
+]
 
 [tool.uv.workspace]
 members = [
@@ -322,6 +335,16 @@ explicit = true
 [[tool.uv.index]]
 name = "flashinfer-cu130"
 url = "https://flashinfer.ai/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-nightly"
+url = "https://flashinfer.ai/whl/nightly"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-nightly-cu130"
+url = "https://flashinfer.ai/whl/nightly/cu130"
 explicit = true
 
 [tool.uv]
@@ -390,6 +413,8 @@ override-dependencies = [
   # line above selects needs >=0.1.9, and flash-attn-4 needs >=0.1.12 for
   # map_dataclass_to_tuple. Take the newer one; trtllm extra unsatisfiable on cp313 otherwise.
   "apache-tvm-ffi>=0.1.12,<0.2",
+  # flash-attn-4 4.0.0b26 pins cutlass-dsl==4.6.0.dev0; flashinfer 0.6.18 nightly needs 4.7.0.
+  "nvidia-cutlass-dsl==4.7.0",
   # Override dependencies to address CVEs
   "mlflow>=3.13.0",
   # Override langchain-core to address CVE GHSA-qh6h-p6c9-ff54 (path traversal in load_prompt)
@@ -445,11 +470,6 @@ constraint-dependencies = [
   "av>=17.1.0",                               # Address CVE-2026-40962 (FFmpeg 8.0.1 bundled in av.libs; 17.1.0+ ships FFmpeg 8.1.x)
   "opencv-python-headless>=5.0.0",            # CVE floor: patches CVE-2025-9951, CVE-2025-1594, CVE-2024-31582 (bundled FFmpeg 5.1.6 in 4.x)
 ]
-
-# Workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base
-# and libs-cu13 wheels overlap and race on shared paths. libs-cu13 is a
-# functional superset at 4.5.2, so drop libs-base to make installs deterministic.
-exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
 
 conflicts = [
   [

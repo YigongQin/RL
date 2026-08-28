@@ -77,8 +77,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    py = _venv_python()
     if args.post_sync:
-        py = _venv_python()
         if not os.path.isfile(py):
             print(
                 f"[mcore-fla] worker venv not present yet ({py}); "
@@ -86,8 +86,12 @@ def main() -> None:
                 flush=True,
             )
             return
-    else:
+    elif _FORCE or not os.path.isfile(py):
+        # create_local_venv always runs `uv sync` (even without NRL_FORCE_REBUILD_VENVS).
+        # Skip that when the Lustre worker interpreter already exists.
         py = create_local_venv(_PE, _VENV, force_rebuild=_FORCE)
+    else:
+        print(f"[mcore-fla] reusing existing worker venv (no uv sync): {py}", flush=True)
 
     _strip_tilelang(py)
     print(f"[mcore-fla] mcore venv ready (model={_MODEL or 'unknown'}): {py}", flush=True)

@@ -59,6 +59,7 @@ from nemo_rl.models.generation.megatron.megatron_worker import (
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.common import get_moe_metrics
+from nemo_rl.models.megatron.cutedsl_w4a16 import maybe_pack_cutedsl_w4a16_weights
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
@@ -886,6 +887,7 @@ class MegatronPolicyWorkerImpl(
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
+                    maybe_pack_cutedsl_w4a16_weights(self.model, self.cfg["megatron_cfg"])
                     # Megatron-LM PR #4116 replaced the optimizer.mtp_grad_norm attribute
                     # with a per-group dict populated during gradient clipping. Value is
                     # None when clip_grad == 0 or this rank owns no MTP-tagged params
@@ -1452,6 +1454,7 @@ class MegatronPolicyWorkerImpl(
         # opt.step clips internally (clip_grad config); operates on the
         # already-rescaled grad. Returns (success, grad_norm, num_zeros).
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+        maybe_pack_cutedsl_w4a16_weights(self.model, self.cfg["megatron_cfg"])
 
         pg_collection = get_pg_collection(self.model)
         update_successful = logical_and_across_model_parallel_group(
@@ -2702,6 +2705,7 @@ class MegatronPolicyWorkerImpl(
 
         gc.collect()
         torch.cuda.empty_cache()
+        maybe_pack_cutedsl_w4a16_weights(self.model, self.cfg["megatron_cfg"])
 
     def prepare_for_training(self, *args, **kwargs):
         # onload models and optimizer state to cuda

@@ -132,6 +132,7 @@ class MegatronGeneration(GenerationInterface):
                 "transformer_impl",
                 "inference_grouped_gemm_backend",
                 "inference_moe_token_dispatcher_type",
+                "moe_cutedsl_w4a16",
                 "tensor_model_parallel_size",
                 "pipeline_model_parallel_size",
                 "expert_model_parallel_size",

@@ -43,6 +43,7 @@ from nemo_rl.models.generation.megatron.utils import (
     log_gpu_memory,
     resolve_torch_dtype,
 )
+from nemo_rl.models.megatron.cutedsl_w4a16 import maybe_pack_cutedsl_w4a16_weights
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
@@ -424,6 +425,7 @@ class MegatronGenerationMixin:
                 self._run_async_coordinator_start()
             else:
                 self._wake()
+            maybe_pack_cutedsl_w4a16_weights(self.model, self.cfg["megatron_cfg"])
 
         log_gpu_memory("prepare_for_generation END")
 
