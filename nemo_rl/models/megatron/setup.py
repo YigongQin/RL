@@ -131,9 +131,7 @@ def _patch_hf_config_double_instantiation():
 
 
 try:
-    from megatron.core.distributed import (
-        TorchFullyShardedDataParallel as torch_FSDP,  # noqa: F401 unused-import
-    )
+    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP  # noqa: F401 unused-import
 
     HAVE_FSDP2 = True
 except ImportError:
@@ -284,6 +282,9 @@ def enable_batch_invariant_mode(config: PolicyConfig) -> None:
         AssertionError: If the installed Transformer Engine cannot pin the
             requested FlashAttention version.
     """
+    if not config.get("megatron_cfg", {}).get("batch_invariant_mode"):
+        return
+
     result = validate_batch_invariant_mode(config)
     result.raise_if_invalid("batch_invariant_mode=True failed validation:")
     enable_batch_invariant_kernels(config)
