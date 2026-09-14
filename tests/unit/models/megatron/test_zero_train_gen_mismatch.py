@@ -78,6 +78,26 @@ def test_transformer_engine_gen_warns_not_fails():
     assert any("inference_optimized" in w for w in result.warnings)
 
 
+def test_flashinfer_mxfp8_rejected_for_zero_train_gen_mismatch():
+    config = _zero_kl_config(
+        megatron_cfg={
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8_recipe": "mxfp8",
+            }
+        }
+    )
+    config["generation"]["mcore_generation_config"][
+        "inference_grouped_gemm_backend"
+    ] = "flashinfer"
+
+    result = validate_zero_train_gen_mismatch(
+        config, check_packages=False, check_platform=False
+    )
+
+    assert any("not bitwise identical" in violation for violation in result.violations)
+
+
 def test_resolve_applies_batch_invariant_defaults():
     config = _zero_kl_config(
         megatron_cfg={"batch_invariant_mode": False, "moe_permute_fusion": True}

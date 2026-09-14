@@ -289,6 +289,22 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
             "worker for better performance."
         )
 
+    fp8_cfg = inference_cfg.get("fp8_cfg") or {}
+    grouped_gemm_backend = inference_cfg.get("inference_grouped_gemm_backend")
+    grouped_gemm_backend = getattr(grouped_gemm_backend, "value", grouped_gemm_backend)
+    if (
+        impl == "inference_optimized"
+        and grouped_gemm_backend == "flashinfer"
+        and fp8_cfg.get("enabled")
+        and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    ):
+        out.violations.append(
+            "zero_train_gen_mismatch does not support "
+            "inference_grouped_gemm_backend='flashinfer' with MXFP8: the FlashInfer "
+            "kernel is batch-invariant but not bitwise identical to TE training. "
+            "Use the Torch or vLLM MXFP8 exact-parity path."
+        )
+
 
 def _validate_platform(
     config: PolicyConfig, out: ZeroTrainGenValidation, *, check_device: bool
