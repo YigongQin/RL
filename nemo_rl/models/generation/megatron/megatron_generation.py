@@ -296,8 +296,8 @@ class MegatronGeneration(GenerationInterface):
             port: Port for the process group rendezvous.
             world_size: Total world size (train + inference workers).
             train_world_size: Number of training workers (used to offset ranks).
-            refit_backend: Copy service backend ("gloo" or "nccl";
-                "nvshmem" is currently broken and warns at setup).
+            refit_backend: Copy service backend ("gloo", "nccl", or
+                "nccl_m2n"; "nvshmem" is currently broken and warns at setup).
 
         Returns:
             List of Ray ObjectRefs for the collective init futures.

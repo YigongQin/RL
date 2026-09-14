@@ -31,6 +31,7 @@ from megatron.core.inference.config import (
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import set_decode_expert_padding
+from megatron.core.resharding.copy_services.base import CopyService
 from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
 from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
 from megatron.core.resharding.refit import (
@@ -59,16 +60,44 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
-from nemo_rl.models.generation.megatron.utils import (
-    log_gpu_memory,
-    resolve_torch_dtype,
-)
+from nemo_rl.models.generation.megatron.utils import log_gpu_memory, resolve_torch_dtype
 from nemo_rl.models.megatron.memory_saver import (
     HAVE_TORCH_MEMORY_SAVER,
     pause_inference_weights,
     resume_inference_weights,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+
+
+def _refit_backend_uses_nccl(refit_backend: str) -> bool:
+    """Return whether a refit backend transfers CUDA tensors through NCCL."""
+    return refit_backend in ("nccl", "nccl_m2n")
+
+
+def _create_refit_copy_service(
+    refit_backend: str, group: torch.distributed.ProcessGroup
+) -> CopyService:
+    """Create the configured MCore copy service for a cross-world refit group."""
+    if refit_backend == "nvshmem":
+        # Deferred because importing the service loads optional NVSHMEM bindings.
+        from megatron.core.resharding.copy_services.nvshmem_copy_service import (
+            NVSHMEMCopyService,
+        )
+
+        return NVSHMEMCopyService(group=group)
+    if refit_backend == "nccl_m2n":
+        # Deferred so NeMo RL remains importable with MCore revisions that do
+        # not yet provide the optional native M2N copy service.
+        from megatron.core.resharding.copy_services.nccl_m2n_copy_service import (
+            NCCLM2NCopyService,
+        )
+
+        return NCCLM2NCopyService(group=group)
+    if refit_backend == "nccl":
+        return NCCLCopyService(group=group)
+    if refit_backend == "gloo":
+        return GlooCopyService(group=group)
+    raise ValueError(f"Unsupported Megatron refit backend: {refit_backend!r}")
 
 
 class MegatronGenerationMixin:
@@ -948,8 +977,8 @@ class MegatronGenerationRefitMixin:
             port: Port for the process group rendezvous.
             world_size: Total world size (train + inference workers).
             rank_offset: Offset for this side's ranks (`train_world_size` for inference).
-            refit_backend: Copy-service backend ("gloo" or "nccl";
-                "nvshmem" is currently broken, see the issue below).
+            refit_backend: Copy-service backend ("gloo", "nccl", or
+                "nccl_m2n"; "nvshmem" is currently broken, see the issue below).
         """
         if refit_backend == "nvshmem":
             warnings.warn(
@@ -1000,7 +1029,7 @@ class MegatronGenerationRefitMixin:
         # registered for the cuda device on this cross-world PG. GLOO stays the
         # default backend so the object collectives in `prepare_swap_model_weights`
         # (all_gather_object / broadcast_object_list) keep using CPU tensors.
-        if refit_backend == "nccl":
+        if _refit_backend_uses_nccl(refit_backend):
             from torch.distributed.distributed_c10d import ProcessGroupNCCL
 
             # Ensure the NCCL communicator binds to this rank's own GPU.
@@ -1031,17 +1060,9 @@ class MegatronGenerationRefitMixin:
         _world.pg_map[pg] = ("gloo", pg_prefix_store)
         _world.pg_names[pg] = group_name
 
-        if refit_backend == "nvshmem":
-            # Deferred: importing NVSHMEMCopyService loads the optional nvshmem bindings.
-            from megatron.core.resharding.copy_services.nvshmem_copy_service import (
-                NVSHMEMCopyService,
-            )
-
-            self.refit_copy_service = NVSHMEMCopyService(group=self.refit_pg)
-        elif refit_backend == "nccl":
-            self.refit_copy_service = NCCLCopyService(group=self.refit_pg)
-        else:
-            self.refit_copy_service = GlooCopyService(group=self.refit_pg)
+        self.refit_copy_service = _create_refit_copy_service(
+            refit_backend, self.refit_pg
+        )
 
         is_source = rank_offset == 0
         # Cache for later refit calls (swap_weights_via_reshard).

@@ -55,7 +55,10 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # or "raw_logprobs" (F.log_softmax of model logits). Zero-KL forces raw.
     logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
 
-    refit_backend: Literal["gloo", "nccl", "nvshmem"]
+    # Copy-service backend for Megatron weight refit. NCCL M2N is available only
+    # to non-colocated generation because its source and destination meshes must
+    # be disjoint.
+    refit_backend: Literal["gloo", "nccl", "nccl_m2n", "nvshmem"]
     num_speculative_tokens: int
 
     mamba_inference_ssm_states_dtype: NotRequired[str]
