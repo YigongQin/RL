@@ -228,10 +228,7 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.models.generation.megatron.config import (
-    dedicated_inference_megatron_cfg,
-    merged_inference_megatron_cfg,
-)
+from nemo_rl.models.generation.megatron.config import dedicated_inference_megatron_cfg
 from nemo_rl.models.megatron.community_import import (
     import_model_from_hf_name,
     iter_vlm_config_overrides,
@@ -248,15 +245,15 @@ from nemo_rl.models.megatron.draft.utils import (
     get_attached_draft_model,
 )
 from nemo_rl.models.megatron.memory_saver import inference_model_alloc_region
-from nemo_rl.models.megatron.zero_train_gen_mismatch import (
-    configure_zero_train_gen_mismatch,
-    enable_batch_invariant_kernels,
-    validate_batch_invariant_mode,
-)
 from nemo_rl.models.megatron.router_replay import (
     clear_global_router_replay_instances,
     router_replay_enabled,
     validate_router_replay_config,
+)
+from nemo_rl.models.megatron.zero_train_gen_mismatch import (
+    configure_zero_train_gen_mismatch,
+    enable_batch_invariant_kernels,
+    validate_batch_invariant_mode,
 )
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.policy.utils import (
@@ -361,10 +358,9 @@ def _skip_megatron_moe_bi_fp8_assert() -> None:
             orig_post_init(self)
         except AssertionError as e:
             msg = str(e)
-            is_moe_bi_fp8_gate = (
-                "Batch-invariant MoE is bf16-only" in msg
-                or "Batch-invariant MoE supports bf16, or native TE MXFP8" in msg
-            )
+            is_moe_bi_fp8_gate = msg.startswith(
+                "Batch-invariant MoE supports bf16"
+            ) or ("Batch-invariant MoE is bf16-only" in msg)
             if not is_moe_bi_fp8_gate:
                 raise
             # Keep Megatron's rule for inference_optimized MoE+BI+FP8; training
@@ -1278,6 +1274,18 @@ def _validate_te_precision_config(
                 )
 
 
+def _apply_inference_mxfp8_parameter_filters(
+    model_cfg: Any, megatron_cfg: Mapping[str, Any]
+) -> None:
+    """Carry mixed BF16/MXFP8 parameter selection onto a model provider."""
+    for filter_name in (
+        "inference_mxfp8_include_parameters",
+        "inference_mxfp8_exclude_parameters",
+    ):
+        if filter_name in megatron_cfg:
+            setattr(model_cfg, filter_name, megatron_cfg[filter_name])
+
+
 def _apply_precision_config(
     model_cfg: Any, config: PolicyConfig, dtype: torch.dtype
 ) -> None:
@@ -1300,6 +1308,10 @@ def _apply_precision_config(
         "float16": torch.float16,
     }
     model_cfg.pipeline_dtype = dtype_map[config["megatron_cfg"]["pipeline_dtype"]]
+
+    # These filters are consumed after checkpoint load when inference-optimized
+    # layers convert TE MXFP8 parameters into their runtime representation.
+    _apply_inference_mxfp8_parameter_filters(model_cfg, config["megatron_cfg"])
 
     te_precision_config_file = config["megatron_cfg"].get("te_precision_config_file")
     if te_precision_config_file is not None:
@@ -1349,6 +1361,24 @@ def _inference_optimized_gpt_layer_spec(provider: Any, vp_stage: Any = None) -> 
         num_experts=getattr(provider, "num_moe_experts", None),
         moe_grouped_gemm=getattr(provider, "moe_grouped_gemm", False),
     )
+
+
+def _apply_transformer_impl_config(
+    model_cfg: Any, megatron_cfg: Mapping[str, Any]
+) -> None:
+    """Apply the transformer implementation and its matching Bridge layer spec."""
+    if "transformer_impl" not in megatron_cfg:
+        return
+
+    model_cfg.transformer_impl = megatron_cfg["transformer_impl"]
+    # Bridge GPTModelProvider.default_layer_spec only branches on
+    # use_transformer_engine_full_layer_spec (both branches TE), so
+    # transformer_impl=inference_optimized would otherwise still build TE
+    # modules. Assign the infopt GPT spec through the provider override
+    # (same hook the modelopt path uses). Callable so it resolves against
+    # finalized provider fields at provide() time.
+    if model_cfg.transformer_impl == "inference_optimized":
+        model_cfg.transformer_layer_spec = _inference_optimized_gpt_layer_spec
 
 
 def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -1443,16 +1473,7 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         ]
 
     # These overrides need to be applied before the workers spawn.
-    if "transformer_impl" in config["megatron_cfg"]:
-        model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
-        # Bridge GPTModelProvider.default_layer_spec only branches on
-        # use_transformer_engine_full_layer_spec (both branches TE), so
-        # transformer_impl=inference_optimized would otherwise still build TE
-        # modules. Assign the infopt GPT spec through the provider override
-        # (same hook the modelopt path uses). Callable so it resolves against
-        # finalized provider fields at provide() time.
-        if model_cfg.transformer_impl == "inference_optimized":
-            model_cfg.transformer_layer_spec = _inference_optimized_gpt_layer_spec
+    _apply_transformer_impl_config(model_cfg, config["megatron_cfg"])
     if "cuda_graph_impl" in config["megatron_cfg"]:
         model_cfg.cuda_graph_impl = config["megatron_cfg"]["cuda_graph_impl"]
         if model_cfg.cuda_graph_impl != "none":
@@ -1880,10 +1901,10 @@ def build_inference_model(
     train_pipeline_model_parallel_size = inference_provider.pipeline_model_parallel_size
     _apply_parallelism_config(inference_provider, policy_cfg)
     _apply_moe_config(inference_provider, policy_cfg)
-    if "transformer_impl" in policy_cfg["megatron_cfg"]:
-        inference_provider.transformer_impl = policy_cfg["megatron_cfg"][
-            "transformer_impl"
-        ]
+    _apply_inference_mxfp8_parameter_filters(
+        inference_provider, policy_cfg["megatron_cfg"]
+    )
+    _apply_transformer_impl_config(inference_provider, policy_cfg["megatron_cfg"])
     # CUDA graph config needs to be set correctly before init.
     if "cuda_graph_impl" in policy_cfg["megatron_cfg"]:
         cuda_graph_impl = policy_cfg["megatron_cfg"]["cuda_graph_impl"]

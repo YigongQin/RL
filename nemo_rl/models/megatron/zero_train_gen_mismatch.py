@@ -24,14 +24,15 @@ import subprocess
 import warnings
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
-from packaging.version import Version
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping
+
+from packaging.version import Version
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy import PolicyConfig
 
 # TE MXFP8 grouped MoE inference (Megatron-LM PR #6933) and batch-invariant follow-ups.
-MEGATRON_CORE_MIN_COMMIT_SHA = "c5dedf8424c63123d8ef7966ad165f6c6e528255"
+MEGATRON_CORE_MIN_COMMIT_SHA = "34a51b187ff8922e56efdad49df99983e421b610"
 
 TRANSFORMER_ENGINE_MIN_VERSION = Version("2.18")
 FLASH_ATTN_MIN_VERSION = Version("2.8.1")
@@ -424,8 +425,7 @@ def _validate_packages(out: ZeroTrainGenValidation) -> None:
     fa4 = _first_package_version(("flash-attn-4", "flash_attn_4"))
     if fa4 is None or fa4 < FLASH_ATTN_4_MIN_VERSION:
         out.violations.append(
-            f"flash-attn-4>={FLASH_ATTN_4_MIN_VERSION} required "
-            f"(got {fa4})."
+            f"flash-attn-4>={FLASH_ATTN_4_MIN_VERSION} required (got {fa4})."
         )
     cutedsl = _package_version("nvidia-cutlass-dsl")
     if cutedsl is None or cutedsl < CUTEDSL_MIN_VERSION:

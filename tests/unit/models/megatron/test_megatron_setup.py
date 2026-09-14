@@ -599,9 +599,7 @@ class TestApplyModelOverrides:
 
     def test_rejects_first_class_megatron_config_conflict(self):
         """A first-class field cannot also be supplied through model_overrides."""
-        from nemo_rl.models.megatron.setup import (
-            _validate_model_override_conflicts,
-        )
+        from nemo_rl.models.megatron.setup import _validate_model_override_conflicts
 
         with pytest.raises(
             ValueError,
@@ -1014,6 +1012,82 @@ class TestApplyPrecisionConfig:
             }
             _apply_precision_config(model_cfg, config, torch.float32)
             assert model_cfg.pipeline_dtype == expected_dtype
+
+    def test_applies_mxfp8_inference_parameter_filters(self):
+        """Mixed-precision parameter filters reach the Megatron model config."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "inference_mxfp8_include_parameters": r".*mlp\.experts\.linear_fc[12]",
+                "inference_mxfp8_exclude_parameters": r".*shared_experts.*",
+            }
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert (
+            model_cfg.inference_mxfp8_include_parameters
+            == r".*mlp\.experts\.linear_fc[12]"
+        )
+        assert model_cfg.inference_mxfp8_exclude_parameters == r".*shared_experts.*"
+
+    def test_colocated_inference_model_applies_generation_filters(self, monkeypatch):
+        """The colocated provider keeps generation-only precision and layer choices."""
+        import nemo_rl.models.megatron.setup as setup
+
+        include_pattern = r".*mlp\.experts\.linear_fc[12]"
+        provider = SimpleNamespace(
+            pipeline_model_parallel_size=1,
+            tensor_model_parallel_size=1,
+            context_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            sequence_parallel=False,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+        )
+
+        def finalize():
+            assert provider.inference_mxfp8_include_parameters == include_pattern
+            assert (
+                provider.transformer_layer_spec
+                is setup._inference_optimized_gpt_layer_spec
+            )
+
+        provider.finalize = MagicMock(side_effect=finalize)
+        inference_model = MagicMock()
+        get_model = MagicMock(return_value=[inference_model])
+        monkeypatch.setattr(setup, "_apply_parallelism_config", lambda *_: None)
+        monkeypatch.setattr(setup, "_apply_moe_config", lambda *_: None)
+        monkeypatch.setattr(
+            setup, "build_inference_pg_collection", lambda *_args, **_kwargs: object()
+        )
+        monkeypatch.setattr(setup, "get_model", get_model)
+        monkeypatch.setattr(setup, "inference_model_alloc_region", MagicMock)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+
+        policy_cfg = {
+            "megatron_cfg": {
+                "transformer_impl": "inference_optimized",
+                "freeze_moe_router": False,
+                "inference_mxfp8_include_parameters": include_pattern,
+            }
+        }
+        megatron_cfg = SimpleNamespace(
+            ddp=object(),
+            dist=SimpleNamespace(use_tp_pp_dp_mapping=False),
+            rng=SimpleNamespace(data_parallel_random_init=False),
+        )
+
+        result = setup.build_inference_model(policy_cfg, megatron_cfg, provider)
+
+        assert result is inference_model
+        provider.finalize.assert_called_once_with()
+        assert get_model.call_args.args[0] is provider
 
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
     def test_loads_te_precision_config_when_configured(
@@ -2962,9 +3036,9 @@ class TestBatchInvariantMode:
 
         config = self._config()
         config["precision"] = "float16"
-        config["generation"]["mcore_generation_config"][
-            "transformer_impl"
-        ] = "inference_optimized"
+        config["generation"]["mcore_generation_config"]["transformer_impl"] = (
+            "inference_optimized"
+        )
 
         with pytest.raises(ValueError, match="inference_optimized"):
             enable_batch_invariant_mode(config)
@@ -2975,9 +3049,9 @@ class TestBatchInvariantMode:
 
         config = self._config()
         config["precision"] = "float16"
-        config["generation"]["mcore_generation_config"][
-            "transformer_impl"
-        ] = "transformer_engine"
+        config["generation"]["mcore_generation_config"]["transformer_impl"] = (
+            "transformer_engine"
+        )
 
         support_check = (
             "megatron.core.transformer.custom_layers.batch_invariant_kernels."
@@ -4458,7 +4532,9 @@ def _stub_zero_kl_patches():
             "nemo_rl.models.megatron.zero_train_gen_mismatch.validate_batch_invariant_mode",
             return_value=noop,
         ),
-        patch("nemo_rl.models.megatron.zero_train_gen_mismatch.enable_batch_invariant_kernels"),
+        patch(
+            "nemo_rl.models.megatron.zero_train_gen_mismatch.enable_batch_invariant_kernels"
+        ),
         patch("nemo_rl.models.megatron.setup._skip_megatron_moe_bi_fp8_assert"),
     ):
         yield
@@ -4497,7 +4573,9 @@ def test_zero_train_gen_mismatch_warns_on_conflicting_knobs():
     )
 
     with _stub_zero_kl_patches():
-        with pytest.warns(UserWarning, match="moe_permute_fusion|enable_chunked_prefill"):
+        with pytest.warns(
+            UserWarning, match="moe_permute_fusion|enable_chunked_prefill"
+        ):
             enable_zero_train_gen_kl(config)
 
     assert config["megatron_cfg"]["moe_permute_fusion"] is False
@@ -4542,6 +4620,12 @@ def test_zero_train_gen_mismatch_allows_noncolocated_generation():
             "Batch-invariant MoE supports bf16, or native TE MXFP8 squared-ReLU "
             "or SwiGLU experts with the inference-optimized TE grouped-GEMM and "
             "te_native batch-invariant backends."
+        ),
+        (
+            "Batch-invariant MoE supports bf16, native TE MXFP8 squared-ReLU/"
+            "SwiGLU experts, Torch/vLLM MXFP8 squared-ReLU/SwiGLU experts, or "
+            "FlashInfer MXFP8 squared-ReLU experts with the inference-optimized "
+            "transformer implementation."
         ),
     ],
 )
