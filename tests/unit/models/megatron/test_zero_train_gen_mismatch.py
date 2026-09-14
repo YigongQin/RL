@@ -62,7 +62,7 @@ def test_collects_multiple_violations():
     )
     assert len(result.violations) >= 2
     with pytest.raises(ValueError, match="failed validation"):
-        result.raise_if_invalid("zero_train_gen_mismatch:")
+        result.raise_if_invalid("zero_train_gen_mismatch failed validation:")
 
 
 def test_transformer_engine_gen_warns_not_fails():
@@ -89,9 +89,7 @@ def test_resolve_applies_batch_invariant_defaults():
     assert config["megatron_cfg"]["moe_permute_fusion"] is False
 
 
-@patch(
-    "nemo_rl.models.megatron.zero_train_gen_mismatch._validate_megatron_core_commit"
-)
+@patch("nemo_rl.models.megatron.zero_train_gen_mismatch._validate_megatron_core_commit")
 @patch("nemo_rl.models.megatron.zero_train_gen_mismatch._package_version")
 def test_package_check_requires_te(mock_pkg_version, mock_mcore_commit):
     mock_mcore_commit.side_effect = lambda _min, out: None
