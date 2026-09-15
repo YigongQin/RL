@@ -372,10 +372,11 @@ class MegatronGenerationMixin:
         if logging_step_interval is None:
             logging_step_interval = 0
 
-        # flashinfer's fused-RoPE kernel only dispatches fp16/bf16 q/k.
-        use_flashinfer_fused_rope = gen_model.config.params_dtype in (
-            torch.float16,
-            torch.bfloat16,
+        # FlashInfer's fused RoPE supports fp16/bf16, but does not match the
+        # training RoPE arithmetic required by batch-invariant inference.
+        use_flashinfer_fused_rope = (
+            not gen_model.config.batch_invariant_mode
+            and gen_model.config.params_dtype in (torch.float16, torch.bfloat16)
         )
 
         inference_config = InferenceConfig(

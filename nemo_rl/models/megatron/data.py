@@ -187,6 +187,10 @@ def _get_non_packed_sequence_pad_factor(cfg: dict[str, Any]) -> int:
         and megatron_cfg["sequence_parallel"]
     ):
         factor = lcm(factor, megatron_cfg["tensor_model_parallel_size"])
+    if megatron_cfg.get("batch_invariant_mode"):
+        factor = batch_invariant_token_multiple(
+            factor, megatron_cfg["tensor_model_parallel_size"]
+        )
     return factor
 
 
