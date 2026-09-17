@@ -389,8 +389,29 @@ class MegatronConfig(TypedDict):
     # Options are 'nvls' (requires Hopper+ NVLink) and 'nccl' (fallback for non-NVLS systems).
     inference_moe_token_dispatcher_type: NotRequired[str]
     # Backend for grouped-GEMM during inference-optimized MoE forward.
-    # Options: 'flashinfer', 'torch', 'vllm' (mcore default).
+    # Options: 'flashinfer', 'torch', 'vllm' (mcore default), 'flashinfer_mega'.
+    # 'flashinfer_mega' is the fused expert-parallel megakernel: it owns EP
+    # transport, so inference_moe_token_dispatcher_type does not apply to it.
     inference_grouped_gemm_backend: NotRequired[str]
+    # Precision of the flashinfer_mega kernel.
+    # Options: 'bf16', 'mxfp8', 'nvfp4', 'fp8_fp4'. Only 'bf16' supports refit
+    # (the others quantize inside FlashInfer's weight preprocessing, which
+    # cannot be rebuilt from the parameters) or moe_mega_training_forward.
+    inference_mega_precision: NotRequired[str]
+    # Hard cap on local tokens per EP rank for flashinfer_mega. The kernel
+    # rejects a wider forward rather than falling back, so size it for the
+    # largest prefill chunk a rank can receive.
+    inference_mega_max_tokens_per_rank: NotRequired[int]
+    # Run the *training* MoE forward through the flashinfer_mega kernel while
+    # taking the backward from the TE recompute pass, so the training forward
+    # and generation execute the same kernel. For train/generation parity in
+    # RL, not throughput. Requires recompute_granularity='selective' with
+    # 'moe' in recompute_modules, and inference_mega_precision='bf16'.
+    moe_mega_training_forward: NotRequired[bool]
+    # Set by merged_inference_megatron_cfg on the config a dedicated generation
+    # model runs with, so code handed a megatron_cfg can tell which side of the
+    # train/generation split it is looking at. Never set in a recipe.
+    is_inference_model: NotRequired[bool]
     # InferenceTopKRouter requires moe_router_num_groups=None
     # (used when transformer_impl='inference_optimized')
     moe_router_num_groups: NotRequired[int | None]

@@ -14,13 +14,15 @@
 
 from __future__ import annotations
 
+import sys
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from nemo_rl.models.megatron.zero_train_gen_mismatch import (
     ZeroTrainGenValidation,
+    mega_backend_selected,
     resolve_zero_train_gen_mismatch,
     validate_zero_train_gen_mismatch,
 )
@@ -107,6 +109,264 @@ def test_resolve_applies_batch_invariant_defaults():
 
     assert config["megatron_cfg"]["batch_invariant_mode"] is True
     assert config["megatron_cfg"]["moe_permute_fusion"] is False
+
+
+def _mega_config(**kwargs: Any) -> dict[str, Any]:
+    """A zero-KL config whose generation selects the FlashInfer megakernel."""
+    config = _zero_kl_config(**kwargs)
+    config["generation"]["mcore_generation_config"].update(
+        {
+            "inference_grouped_gemm_backend": "flashinfer_mega",
+            "inference_mega_max_tokens_per_rank": 10240,
+        }
+    )
+    return config
+
+
+def test_mega_backend_is_detected_from_generation_config():
+    assert mega_backend_selected(_mega_config()) is True
+    assert mega_backend_selected(_zero_kl_config()) is False
+
+
+def test_resolve_forces_the_mega_training_forward():
+    """The megakernel on the generation side implies it on the training side.
+
+    Without this the training forward runs TransformerEngine against a
+    megakernel generation, which is the ~6e-3 mismatch zero-KL exists to remove.
+    """
+    config = _mega_config()
+    resolve_zero_train_gen_mismatch(config)
+
+    mc = config["megatron_cfg"]
+    assert mc["moe_mega_training_forward"] is True
+    assert mc["activation_checkpointing"] is True
+    assert mc["recompute_granularity"] == "selective"
+    assert "moe" in mc["recompute_modules"]
+    inference = config["generation"]["mcore_generation_config"]
+    assert inference["inference_mega_precision"] == "bf16"
+
+
+def test_resolve_appends_moe_to_existing_recompute_modules():
+    """recompute_modules is additive: the recipe may already use it for memory."""
+    config = _mega_config(megatron_cfg={"recompute_modules": ["core_attn"]})
+    resolve_zero_train_gen_mismatch(config)
+
+    assert config["megatron_cfg"]["recompute_modules"] == ["core_attn", "moe"]
+
+
+def test_resolve_is_idempotent_on_recompute_modules():
+    config = _mega_config(megatron_cfg={"recompute_modules": ["moe"]})
+    resolve_zero_train_gen_mismatch(config)
+    resolve_zero_train_gen_mismatch(config)
+
+    assert config["megatron_cfg"]["recompute_modules"] == ["moe"]
+
+
+def test_resolve_overrides_a_quantized_mega_precision_with_a_warning():
+    """Quantized megakernel precisions are silently wrong here, so they are forced.
+
+    They are not bitwise-equal to the bf16 TE training forward, and their
+    weights cannot be rebuilt after a refit, so generation would keep serving
+    pre-refit experts.
+    """
+    config = _mega_config()
+    config["generation"]["mcore_generation_config"]["inference_mega_precision"] = (
+        "nvfp4"
+    )
+
+    with pytest.warns(UserWarning, match="inference_mega_precision"):
+        resolve_zero_train_gen_mismatch(config)
+
+    inference = config["generation"]["mcore_generation_config"]
+    assert inference["inference_mega_precision"] == "bf16"
+
+
+def test_resolve_leaves_non_mega_recipes_untouched():
+    """The mega defaults must not leak into the backends that were already working."""
+    config = _zero_kl_config()
+    resolve_zero_train_gen_mismatch(config)
+
+    mc = config["megatron_cfg"]
+    assert "moe_mega_training_forward" not in mc
+    assert "recompute_granularity" not in mc
+    assert "recompute_modules" not in mc
+
+
+def test_resolved_mega_config_passes_validation():
+    """The resolver and the validator have to agree on what a mega recipe is.
+
+    Asserted as a pair because they encode the same rules twice: the resolver
+    sets the fields and the validator refuses configs without them, so a drift
+    between the two would make every mega run fail on a config nothing can
+    produce.
+    """
+    config = _mega_config()
+    resolve_zero_train_gen_mismatch(config)
+
+    result = validate_zero_train_gen_mismatch(
+        config, check_packages=False, check_platform=False
+    )
+    assert result.violations == []
+
+
+def test_mega_validation_requires_the_training_forward():
+    """An unresolved config, i.e. a caller that validated without resolving."""
+    config = _mega_config()
+
+    result = validate_zero_train_gen_mismatch(
+        config, check_packages=False, check_platform=False
+    )
+    assert any("moe_mega_training_forward" in v for v in result.violations)
+
+
+def test_mega_validation_requires_moe_recompute():
+    """The mega forward saves no intermediates, so the backward needs the recompute."""
+    config = _mega_config(
+        megatron_cfg={
+            "moe_mega_training_forward": True,
+            "recompute_granularity": "full",
+        }
+    )
+
+    result = validate_zero_train_gen_mismatch(
+        config, check_packages=False, check_platform=False
+    )
+    assert any("recompute_granularity" in v for v in result.violations)
+
+
+def test_mega_validation_rejects_local_cuda_graphs():
+    """Local graphs capture the MoE layer whole, which disables that recompute."""
+    config = _mega_config(
+        megatron_cfg={
+            "moe_mega_training_forward": True,
+            "recompute_granularity": "selective",
+            "recompute_modules": ["moe"],
+            "cuda_graph_impl": "local",
+        }
+    )
+
+    result = validate_zero_train_gen_mismatch(
+        config, check_packages=False, check_platform=False
+    )
+    assert any("cuda_graph_impl" in v for v in result.violations)
+
+
+def _generation_side_config(**kwargs: Any) -> dict[str, Any]:
+    """The policy config a dedicated (non-colocated) generation model gets.
+
+    MegatronGeneration stands up its own Policy whose megatron_cfg is the
+    training one with mcore_generation_config layered on top, and those workers
+    then run the same resolve and validation as the training workers.
+    """
+    from nemo_rl.models.generation.megatron.config import (
+        merged_inference_megatron_cfg,
+    )
+
+    config = _mega_config(**kwargs)
+    config["generation"]["colocated"] = {"enabled": False}
+    resolve_zero_train_gen_mismatch(config)
+    return {**config, "megatron_cfg": merged_inference_megatron_cfg(config)}
+
+
+def test_generation_merge_drops_the_training_forward():
+    """It is a training knob, and generation reaches the kernel without it.
+
+    Left inherited it also puts the generation model in a state MCore rejects,
+    because it requires an MoE recompute that local CUDA graphs remove.
+    """
+    gen_config = _generation_side_config()
+
+    assert gen_config["megatron_cfg"]["moe_mega_training_forward"] is False
+    assert gen_config["megatron_cfg"]["is_inference_model"] is True
+
+
+def test_generation_config_may_graph_while_training_does_not():
+    """Job 430144: a correct setup rejected because the two sides were conflated.
+
+    Training must stay eager for the MoE recompute the mega backward comes
+    from, while generation has no backward and graphs for throughput. Both
+    values live under the key `cuda_graph_impl`, and the generation workers
+    validate the merge, so the train-side gate saw 'local' and refused.
+    """
+    gen_config = _generation_side_config()
+    gen_config["generation"]["mcore_generation_config"]["cuda_graph_impl"] = "local"
+    gen_config["megatron_cfg"]["cuda_graph_impl"] = "local"
+
+    result = validate_zero_train_gen_mismatch(
+        gen_config, check_packages=False, check_platform=False
+    )
+    assert result.violations == []
+
+
+def test_resolve_leaves_the_training_knobs_off_the_generation_config():
+    """Resolve runs again inside the generation worker, so it must agree too.
+
+    Otherwise it puts back what the merge deliberately dropped and the
+    validation that follows it in the same call fails on its own output.
+    """
+    gen_config = _generation_side_config()
+    resolve_zero_train_gen_mismatch(gen_config)
+
+    mc = gen_config["megatron_cfg"]
+    assert mc["moe_mega_training_forward"] is False
+    assert mc["activation_checkpointing"] is False
+    # Still selects the megakernel: generation drives it through the backend,
+    # which is why dropping the training forward costs it nothing.
+    assert mc["inference_grouped_gemm_backend"] == "flashinfer_mega"
+    assert mc["transformer_impl"] == "inference_optimized"
+
+
+def test_mega_validation_requires_the_token_cap():
+    """The cap is a hard workspace bound; the kernel rejects a wider forward."""
+    config = _mega_config()
+    resolve_zero_train_gen_mismatch(config)
+    del config["generation"]["mcore_generation_config"][
+        "inference_mega_max_tokens_per_rank"
+    ]
+
+    result = validate_zero_train_gen_mismatch(
+        config, check_packages=False, check_platform=False
+    )
+    assert any(
+        "inference_mega_max_tokens_per_rank" in v for v in result.violations
+    )
+
+
+@patch("nemo_rl.models.megatron.zero_train_gen_mismatch._validate_megatron_core_commit")
+@patch("nemo_rl.models.megatron.zero_train_gen_mismatch._package_version")
+def test_mega_is_held_to_the_same_commit_gate(mock_pkg_version, mock_mcore_commit):
+    """Mega adds no commit gate of its own; moe_ep importability is its guard.
+
+    A mega-specific SHA could only name a commit that is not upstream yet, so
+    it would pass on the tree it was read from and fail on every other, which
+    is worse than not checking.
+    """
+    from nemo_rl.models.megatron.zero_train_gen_mismatch import (
+        MEGATRON_CORE_MIN_COMMIT_SHA,
+    )
+
+    mock_pkg_version.side_effect = lambda name: None
+    config = _mega_config()
+    resolve_zero_train_gen_mismatch(config)
+
+    # Stubbed rather than imported for real: the package check imports
+    # flashinfer.moe_ep, which is heavy and, against a mismatched cubin wheel,
+    # raises something other than ImportError.
+    stubs = {"flashinfer": MagicMock(), "flashinfer.moe_ep": MagicMock()}
+    with patch.dict(sys.modules, stubs):
+        validate_zero_train_gen_mismatch(
+            config, check_packages=True, check_platform=False
+        )
+        mega_gates = [call.args[0] for call in mock_mcore_commit.call_args_list]
+
+        mock_mcore_commit.reset_mock()
+        validate_zero_train_gen_mismatch(
+            _zero_kl_config(), check_packages=True, check_platform=False
+        )
+        plain_gates = [call.args[0] for call in mock_mcore_commit.call_args_list]
+
+    assert mega_gates == [MEGATRON_CORE_MIN_COMMIT_SHA]
+    assert plain_gates == [MEGATRON_CORE_MIN_COMMIT_SHA]
 
 
 @patch("nemo_rl.models.megatron.zero_train_gen_mismatch._validate_megatron_core_commit")

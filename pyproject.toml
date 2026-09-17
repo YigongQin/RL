@@ -233,9 +233,31 @@ mcore = [
   "mamba-ssm",
   "causal-conv1d",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
-  "flashinfer-python==0.6.8.post1",
-  "flashinfer-cubin==0.6.8.post1",
-  "flashinfer-jit-cache==0.6.8.post1",
+  # Git rev, not a release: the MoE expert-parallel megakernels
+  # (flashinfer.moe_ep, used by MCore inference_grouped_gemm_backend=
+  # 'flashinfer_mega') do not exist in any published 0.6.x wheel -- the module
+  # is simply absent. Bump this rev to move the megakernels.
+  #
+  # flashinfer-cubin / flashinfer-jit-cache are deliberately NOT listed
+  # alongside it. They are versioned in lockstep with flashinfer-python and
+  # refuse to load against a mismatched one, and no cubin wheel exists for a
+  # git rev. The megakernels need neither: they are compiled by CuTeDSL at
+  # runtime (hence nvidia-cutlass-dsl below) and read no prebuilt cubin. The
+  # cost is that FlashInfer's cubin-backed kernels (the routed-MXFP8 grouped
+  # GEMM behind inference_grouped_gemm_backend='flashinfer', and its TRT-LLM
+  # attention) fall back to downloading artifacts at runtime instead of
+  # getting them from the wheel, which needs network on the compute node.
+  "flashinfer-python @ git+https://github.com/flashinfer-ai/flashinfer.git@e500442f83fe9aac7969eb1c8731b6921fa6f180",
+  # deep_gemm is deliberately NOT here, matching mcore, which keeps it behind its
+  # own `batch_invariant` extra with a guarded import. Its only consumer on this
+  # stack is the megakernel's fp8_fp4 precision (blockwise-FP8 activations against
+  # MXFP4 weights), which mcore resolves lazily via find_spec -- and that
+  # precision cannot be refit, so it is unusable for RL regardless (see
+  # megatron/core/inference/moe/mega/QUANTIZED_BLOCKERS.md). Listing it here would
+  # make every `uv sync --extra mcore` build it from source, which needs elfutils
+  # headers (`apt-get install libdw-dev`) that pyproject cannot express, for a
+  # package the venv never imports. Note mcore pins a different rev (714dd1a4)
+  # than the vllm extra above (67fc6486); pick one before reintroducing it.
   "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "nvidia-cutlass-dsl[cu13]==4.6.0.dev0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Transitive pre-release of nvidia-cutlass-dsl[cu13]==4.6.0.dev0. uv 0.11 does
@@ -627,6 +649,49 @@ torch-memory-saver = { TMS_CUDA_MAJOR = "13" }
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
 requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
+
+# Verbatim from requirements.txt at the pinned rev, with one constraint
+# relaxed: upstream declares nvidia-cutlass-dsl>=4.6.2a0, which is
+# unsatisfiable here because flash-attn-4==4.0.0b20 pins
+# nvidia-cutlass-dsl==4.6.0.dev0 exactly, and dropping FA4 is not an option
+# (TE Megatron attention_backend=flash needs flash_attn.cute).
+#
+# The floor is stricter than what the megakernels use: the whole
+# moe_ep mega test suite runs against this source tree with cutlass-dsl
+# 4.6.0.dev0 installed. Scoped to version 0.7.0 so the vllm and sglang extras,
+# which take released flashinfer wheels and their own cutlass-dsl, are
+# unaffected.
+#
+# Revisit when flash-attn-4 moves off its exact pin: at that point take
+# upstream's floor instead of this entry. Anything here that upstream adds and
+# this list omits simply will not be installed, so re-derive the list on a rev
+# bump rather than editing it in place.
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-python"
+# Must match flashinfer._build_meta.__version__ at the pinned rev.
+version = "0.7.0"
+requires-dist = [
+  "apache-tvm-ffi>=0.1.11,<0.2",
+  "click",
+  # cuda-python, nccl-extensions and nccl4py are runtime deps of the moe_ep EP
+  # transport backends and are new relative to the 0.6.x wheels this extra used
+  # to take.
+  "cuda-python>=12.0",
+  "cuda-tile>=1.4.0",
+  "einops",
+  "nccl-extensions>=0.1.0",
+  "nccl4py>=0.4.1",
+  "ninja",
+  "numpy",
+  "nvidia-cudnn-frontend>=1.25.0",
+  "nvidia-cutlass-dsl>=4.6.0.dev0", # upstream: >=4.6.2a0
+  "nvidia-ml-py",
+  "packaging>=24.2",
+  "requests",
+  "tabulate",
+  "torch",
+  "tqdm",
+]
 
 [[tool.uv.dependency-metadata]]
 name = "flash-mla"

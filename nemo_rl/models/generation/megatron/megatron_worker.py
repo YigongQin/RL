@@ -1117,6 +1117,12 @@ class MegatronGenerationRefitMixin:
         src_model = self.model if is_source else None
         dst_model = None if is_source else self.model
 
+        # Both sides meet in collectives here and in the extra-state sync below,
+        # so one side arriving late or not at all strands the other with no
+        # output to show for it. These three lines are what tell the two apart
+        # in a log: whichever stage is missing from one side is the mismatch.
+        role = "src" if is_source else "dst"
+        print(f"[Rank {self.rank}] refit {role}: entering swap_model_weights", flush=True)
         swap_model_weights(
             src_model,
             dst_model,
@@ -1126,7 +1132,9 @@ class MegatronGenerationRefitMixin:
             dst_rank_offset=self.refit_dst_rank_offset,
         )
 
+        print(f"[Rank {self.rank}] refit {role}: entering extra-state sync", flush=True)
         self._sync_te_extra_state_after_reshard(is_source)
+        print(f"[Rank {self.rank}] refit {role}: swap complete", flush=True)
         if not is_source:
             self._refresh_te_quantized_weight_cache()
 

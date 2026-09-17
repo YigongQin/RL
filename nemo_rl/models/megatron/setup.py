@@ -1090,6 +1090,22 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.inference_grouped_gemm_backend = config["megatron_cfg"][
             "inference_grouped_gemm_backend"
         ]
+    # FlashInfer megakernel settings, used when
+    # inference_grouped_gemm_backend='flashinfer_mega'. max_tokens_per_rank is a
+    # hard workspace cap, not a hint: the kernel rejects a forward with more
+    # local tokens than this, so it has to cover the widest prefill each EP rank
+    # can see, not just the decode width.
+    for key in (
+        "inference_mega_precision",
+        "inference_mega_max_tokens_per_rank",
+        # Train-side: run the training MoE forward through the megakernel so it
+        # matches generation bit for bit, taking the backward from the TE
+        # recompute pass. Requires selective 'moe' recompute, which is why it
+        # sits with the other recompute settings in _apply_recompute_config.
+        "moe_mega_training_forward",
+    ):
+        if key in config["megatron_cfg"]:
+            setattr(model_cfg, key, config["megatron_cfg"][key])
     if "moe_router_num_groups" in config["megatron_cfg"]:
         model_cfg.moe_router_num_groups = config["megatron_cfg"][
             "moe_router_num_groups"
