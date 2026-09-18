@@ -13,10 +13,11 @@
 # limitations under the License.
 import ast
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock
 
@@ -843,7 +844,9 @@ def test_prepare_fp8_inference_linears_skips_when_fp8_disabled(
     from nemo_rl.models.generation.megatron import megatron_worker
 
     worker = object.__new__(megatron_worker.MegatronGenerationMixin)
-    worker.cfg = {"megatron_cfg": {"fp8_cfg": {"enabled": False, "fp8_recipe": "mxfp8"}}}
+    worker.cfg = {
+        "megatron_cfg": {"fp8_cfg": {"enabled": False, "fp8_recipe": "mxfp8"}}
+    }
     worker.model = object()
     worker.rank = 0
 
@@ -866,6 +869,22 @@ def test_prepare_fp8_inference_linears_skips_when_fp8_cfg_missing() -> None:
     worker.rank = 0
 
     worker._prepare_fp8_inference_linears()
+
+
+def test_nccl_m2n_is_an_nccl_backed_refit_service(monkeypatch) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker
+
+    group = MagicMock()
+    service = MagicMock()
+    constructor = MagicMock(return_value=service)
+    module_name = "megatron.core.resharding.copy_services.nccl_m2n_copy_service"
+    m2n_module = ModuleType(module_name)
+    m2n_module.NCCLM2NCopyService = constructor
+    monkeypatch.setitem(sys.modules, module_name, m2n_module)
+
+    assert megatron_worker._refit_backend_uses_nccl("nccl_m2n")
+    assert megatron_worker._create_refit_copy_service("nccl_m2n", group) is service
+    constructor.assert_called_once_with(group=group)
 
 
 def create_megatron_test_config(

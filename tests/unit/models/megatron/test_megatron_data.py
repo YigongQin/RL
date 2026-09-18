@@ -1388,8 +1388,14 @@ class TestGetMicrobatchIterator:
                 == 32
             )
 
-    def test_non_packed_pad_factor_combines_tp_sequence_parallel_alignment(self):
-        """Dense sequence-parallel batches align to the TP scatter factor."""
+    @pytest.mark.parametrize(
+        "batch_invariant,fp8_enabled,expected",
+        [(False, False, 12), (True, False, 192), (False, True, 96), (True, True, 192)],
+    )
+    def test_non_packed_pad_factor_combines_tp_sequence_parallel_alignment(
+        self, batch_invariant: bool, fp8_enabled: bool, expected: int
+    ) -> None:
+        """Dense batches satisfy TP, precision, and batch-invariant token alignment."""
         from nemo_rl.models.megatron.data import (
             _get_non_packed_sequence_pad_factor,
         )
@@ -1400,11 +1406,12 @@ class TestGetMicrobatchIterator:
                 "tensor_model_parallel_size": 4,
                 "sequence_parallel": True,
                 "context_parallel_size": 1,
-                "fp8_cfg": {"enabled": False},
+                "fp8_cfg": {"enabled": fp8_enabled, "fp8_recipe": "mxfp8"},
+                "batch_invariant_mode": batch_invariant,
             },
         }
 
-        assert _get_non_packed_sequence_pad_factor(cfg) == 12
+        assert _get_non_packed_sequence_pad_factor(cfg) == expected
 
     @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")

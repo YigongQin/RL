@@ -49,6 +49,57 @@ from nemo_rl.models.generation.megatron.megatron_worker import (
 PAD = 0
 
 
+@pytest.mark.mcore
+@pytest.mark.parametrize("batch_invariant", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_inference_rope_selection(
+    monkeypatch: pytest.MonkeyPatch, batch_invariant: bool, dtype: torch.dtype
+) -> None:
+    """BI inference must use training-compatible RoPE, regardless of parameter dtype."""
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            params_dtype=dtype, batch_invariant_mode=batch_invariant
+        ),
+        pg_collection=SimpleNamespace(),
+    )
+    worker = SimpleNamespace(
+        _inference_engine_initialized=False,
+        _gen_model=lambda: model,
+        cfg={"megatron_cfg": {"batch_invariant_mode": batch_invariant}},
+    )
+    generation_config = {
+        "buffer_size_gb": 1,
+        "num_cuda_graphs": 0,
+        "block_size_tokens": 256,
+        "enable_chunked_prefill": False,
+        "use_cuda_graphs_for_non_decode_steps": False,
+        "max_tokens": 256,
+        "kv_cache_management_mode": "persist",
+        "materialize_only_last_token_logits": True,
+        "num_speculative_tokens": 0,
+        "max_model_len": 256,
+        "enable_prefix_caching": False,
+        "logprobs_mode": "raw_logprobs",
+    }
+
+    class ConfigCaptured(Exception):
+        """Stop before constructing the GPU context."""
+
+    def capture_config(**kwargs: object) -> None:
+        assert kwargs["use_flashinfer_fused_rope"] is (
+            not batch_invariant and dtype in (torch.float16, torch.bfloat16)
+        )
+        raise ConfigCaptured
+
+    module_path = "nemo_rl.models.generation.megatron.megatron_worker"
+    monkeypatch.setattr(
+        f"{module_path}.MambaInferenceStateConfig.from_model", lambda _: None
+    )
+    monkeypatch.setattr(f"{module_path}.InferenceConfig", capture_config)
+    with pytest.raises(ConfigCaptured):
+        MegatronGenerationMixin._initialize_inference_engine(worker, generation_config)
+
+
 class FakeInferenceReply:
     """The subset of mcore's DynamicInferenceRequest the parse path reads.
 

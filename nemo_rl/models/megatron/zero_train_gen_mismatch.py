@@ -24,14 +24,18 @@ import subprocess
 import warnings
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
+from typing import TYPE_CHECKING, Any, Literal, Mapping
+
 from packaging.version import Version
-from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy import PolicyConfig
 
-# TE MXFP8 grouped MoE inference (Megatron-LM PR #6933) and batch-invariant follow-ups.
-MEGATRON_CORE_MIN_COMMIT_SHA = "c5dedf8424c63123d8ef7966ad165f6c6e528255"
+# Merged selective inference precision baseline (Megatron-LM #7300). Use the
+# mainline squash commit: development-branch SHAs do not survive squash merges.
+# MXFP8 batch invariance additionally requires the consolidated #7302 changes;
+# MCore validates the supported training/inference combinations during setup.
+MEGATRON_CORE_MIN_COMMIT_SHA = "c101330a9f9e15381a22cce894674b03084c6a41"
 
 TRANSFORMER_ENGINE_MIN_VERSION = Version("2.18")
 FLASH_ATTN_MIN_VERSION = Version("2.8.1")
@@ -234,14 +238,12 @@ def configure_zero_train_gen_mismatch(
     config: PolicyConfig,
     *,
     apply_kernels: bool,
-    register_moe_bi_fp8_skip: Callable[[], None],
 ) -> None:
-    """Resolve, register Megatron config patch, validate, optionally enable kernels."""
+    """Resolve defaults, validate, and optionally enable MCore kernels."""
     if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
         return
 
     resolve_zero_train_gen_mismatch(config)
-    register_moe_bi_fp8_skip()
 
     result = validate_zero_train_gen_mismatch(
         config,
@@ -286,6 +288,22 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
             "zero_train_gen_mismatch: generation uses transformer_impl="
             "'transformer_engine'; use 'inference_optimized' on the generation "
             "worker for better performance."
+        )
+
+    fp8_cfg = inference_cfg.get("fp8_cfg") or {}
+    grouped_gemm_backend = inference_cfg.get("inference_grouped_gemm_backend")
+    grouped_gemm_backend = getattr(grouped_gemm_backend, "value", grouped_gemm_backend)
+    if (
+        impl == "inference_optimized"
+        and grouped_gemm_backend == "flashinfer"
+        and fp8_cfg.get("enabled")
+        and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    ):
+        out.violations.append(
+            "zero_train_gen_mismatch does not support "
+            "inference_grouped_gemm_backend='flashinfer' with MXFP8: the FlashInfer "
+            "kernel is batch-invariant but not bitwise identical to TE training. "
+            "Use the Torch or vLLM MXFP8 exact-parity path."
         )
 
 
@@ -424,8 +442,7 @@ def _validate_packages(out: ZeroTrainGenValidation) -> None:
     fa4 = _first_package_version(("flash-attn-4", "flash_attn_4"))
     if fa4 is None or fa4 < FLASH_ATTN_4_MIN_VERSION:
         out.violations.append(
-            f"flash-attn-4>={FLASH_ATTN_4_MIN_VERSION} required "
-            f"(got {fa4})."
+            f"flash-attn-4>={FLASH_ATTN_4_MIN_VERSION} required (got {fa4})."
         )
     cutedsl = _package_version("nvidia-cutlass-dsl")
     if cutedsl is None or cutedsl < CUTEDSL_MIN_VERSION:

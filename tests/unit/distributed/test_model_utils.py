@@ -27,6 +27,7 @@ from nemo_rl.distributed.model_utils import (
     DistributedLogprobWithSampling,
     _compute_distributed_log_softmax,
     _get_tokens_on_this_cp_rank,
+    _tp_target_logprobs,
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
@@ -40,6 +41,61 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+
+
+def test_tp_target_logprobs_singleton_group_uses_local_log_softmax(monkeypatch):
+    """TP=1 must match Megatron Inference's fused log-softmax bitwise."""
+    logits = torch.tensor(
+        [[[1.0, 2.0, 3.0, 4.0], [8.0, -2.0, 0.5, 1.0]]], dtype=torch.float32
+    )
+    targets = torch.tensor([[3, 0]])
+    singleton_group = object()
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 1)
+
+    actual = _tp_target_logprobs(
+        logits,
+        targets,
+        vocab_start_index=0,
+        vocab_end_index=logits.shape[-1],
+        tp_group=singleton_group,
+        inference_only=True,
+    )
+    expected = (
+        torch.nn.functional.log_softmax(logits, dim=-1)
+        .gather(-1, targets.unsqueeze(-1))
+        .squeeze(-1)
+    )
+
+    assert torch.equal(actual, expected)
+
+
+def test_from_parallel_logits_singleton_group_uses_local_log_softmax(monkeypatch):
+    """The Megatron policy scoring entry point must preserve TP=1 exactness."""
+    logits = torch.tensor(
+        [[[1.0, 2.0, 3.0, 4.0], [8.0, -2.0, 0.5, 1.0], [0.0, 3.0, 1.0, 2.0]]],
+        dtype=torch.float32,
+    )
+    input_ids = torch.tensor([[1, 3, 0]])
+    singleton_group = object()
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 1)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+
+    actual = from_parallel_logits_to_logprobs(
+        logits,
+        input_ids,
+        vocab_start_index=0,
+        vocab_end_index=logits.shape[-1],
+        tp_group=singleton_group,
+        inference_only=True,
+    )
+    shifted_targets = input_ids.roll(-1, dims=-1)
+    expected = (
+        torch.nn.functional.log_softmax(logits, dim=-1)
+        .gather(-1, shifted_targets.unsqueeze(-1))
+        .squeeze(-1)[:, :-1]
+    )
+
+    assert torch.equal(actual, expected)
 
 
 @ray.remote(num_gpus=1)

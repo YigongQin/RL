@@ -55,7 +55,10 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # or "raw_logprobs" (F.log_softmax of model logits). Zero-KL forces raw.
     logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
 
-    refit_backend: Literal["gloo", "nccl", "nvshmem"]
+    # Copy-service backend for Megatron weight refit. NCCL M2N is available only
+    # to non-colocated generation because its source and destination meshes must
+    # be disjoint.
+    refit_backend: Literal["gloo", "nccl", "nccl_m2n", "nvshmem"]
     num_speculative_tokens: int
 
     mamba_inference_ssm_states_dtype: NotRequired[str]
@@ -76,6 +79,10 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # FP8/MXFP8 for the dedicated (non-colocated) inference model;
     # merged into its `megatron_cfg` by `merged_inference_megatron_cfg`.
     fp8_cfg: NotRequired[Fp8Config]
+    # Optional parameter-name filters for mixed BF16/MXFP8 inference. The
+    # expressions are matched against Megatron's fully qualified parameter names.
+    inference_mxfp8_include_parameters: NotRequired[str]
+    inference_mxfp8_exclude_parameters: NotRequired[str]
 
 
 class MCoreGenerationConfig(GenerationConfig):
