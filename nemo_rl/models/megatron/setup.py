@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import copy
-import enum
 import hashlib
 import json
 import os
@@ -131,7 +130,9 @@ def _patch_hf_config_double_instantiation():
 
 
 try:
-    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP  # noqa: F401 unused-import
+    from megatron.core.distributed import (  # noqa: F401 unused-import
+        TorchFullyShardedDataParallel as torch_FSDP,
+    )
 
     HAVE_FSDP2 = True
 except ImportError:
@@ -308,89 +309,7 @@ def enable_zero_train_gen_kl(
     configure_zero_train_gen_mismatch(
         config,
         apply_kernels=apply_kernels,
-        register_moe_bi_fp8_skip=_skip_megatron_moe_bi_fp8_assert,
     )
-
-
-_MOE_BI_FP8_ASSERT_SKIPPED = False
-
-
-def _coerce_mcore_config_enums_to_strings(config: Any) -> None:
-    """Reset MCore enum config fields to strings before __post_init__ reruns.
-
-    Bridge ``finalize()`` and ``ConfigContainer.validate()`` both call MCore
-    ``TransformerConfig.__post_init__``. Some inference_optimized checks compare
-    against string literals (e.g. ``"vllm"``) before converting to enums, so a
-    second pass fails with ``InferenceGroupedGemmBackend.VLLM`` even when the
-    YAML value is correct.
-    """
-    backend = getattr(config, "inference_grouped_gemm_backend", None)
-    if isinstance(backend, enum.Enum):
-        config.inference_grouped_gemm_backend = backend.value
-
-
-def _skip_megatron_moe_bi_fp8_assert() -> None:
-    """Allow training-path MoE+BI+FP8 to bypass Megatron's inference-only FP8 gate.
-
-    Megatron ``TransformerConfig.__post_init__`` rejects MoE + batch_invariant_mode
-    + FP8 unless ``te_mxfp8_inference`` is true (``inference_optimized`` +
-    ``inference_grouped_gemm_backend=te`` + mxfp8 + te_native + SwiGLU/squared-ReLU).
-
-    Zero-KL wiring intentionally splits this across workers:
-
-    - **Training** (``MegatronPolicyWorker`` on the train node): ``megatron_cfg`` has
-      FP8 + ``batch_invariant_backend=te_native`` but no ``inference_optimized`` /
-      ``inference_grouped_gemm_backend`` — TE grouped GEMM is generation-only.
-    - **Generation** (non-colocated dedicated policy): ``merged_inference_megatron_cfg``
-      overlays ``mcore_generation_config`` (``inference_optimized``, backend ``te``,
-      NVLS dispatcher, etc.) and must satisfy the upstream gate unchanged.
-
-    Idempotent.
-    """
-    global _MOE_BI_FP8_ASSERT_SKIPPED
-    if _MOE_BI_FP8_ASSERT_SKIPPED:
-        return
-
-    orig_post_init = TransformerConfig.__post_init__
-
-    def _post_init_allow_te_moe_bi_fp8(self: Any) -> None:
-        _coerce_mcore_config_enums_to_strings(self)
-        try:
-            orig_post_init(self)
-        except AssertionError as e:
-            msg = str(e)
-            is_moe_bi_fp8_gate = msg.startswith(
-                "Batch-invariant MoE supports bf16"
-            ) or ("Batch-invariant MoE is bf16-only" in msg)
-            if not is_moe_bi_fp8_gate:
-                raise
-            # Keep Megatron's rule for inference_optimized MoE+BI+FP8; training
-            # workers use te_native without inference_optimized/TE grouped GEMM.
-            if getattr(self, "transformer_impl", None) == "inference_optimized":
-                raise
-            # Finish BI MoE checks that follow the bf16-only assert upstream.
-            if self.moe_permute_fusion or getattr(
-                self, "moe_permute_fusion_into_hybridep", False
-            ):
-                raise AssertionError(
-                    "Batch-invariant MoE requires the unfused permute/unpermute "
-                    "path so top-k reductions use the fixed batch-invariant add "
-                    "tree."
-                ) from e
-            if getattr(self, "moe_pad_expert_input_to_capacity", False) or getattr(
-                self, "moe_pad_experts_for_cuda_graph_inference", False
-            ):
-                raise AssertionError(
-                    "Batch-invariant MoE supports dynamic dropless routing only. "
-                    "Disable MoE capacity/expert padding."
-                ) from e
-            # Remaining __post_init__ body is packing-only; recipes that use
-            # packing with MoE+BI+FP8 must clear FP8 or extend this skip.
-            if getattr(self, "sequence_packing_scheduler", None) is not None:
-                raise
-
-    TransformerConfig.__post_init__ = _post_init_allow_te_moe_bi_fp8  # type: ignore[method-assign]
-    _MOE_BI_FP8_ASSERT_SKIPPED = True
 
 
 def destroy_parallel_state():
@@ -1310,8 +1229,8 @@ def _apply_precision_config(
     }
     model_cfg.pipeline_dtype = dtype_map[config["megatron_cfg"]["pipeline_dtype"]]
 
-    # These filters are consumed after checkpoint load when inference-optimized
-    # layers convert TE MXFP8 parameters into their runtime representation.
+    # Inference layers consume these filters at construction to choose BF16 or
+    # MXFP8 parameter storage; refits preserve that destination representation.
     _apply_inference_mxfp8_parameter_filters(model_cfg, config["megatron_cfg"])
 
     te_precision_config_file = config["megatron_cfg"].get("te_precision_config_file")

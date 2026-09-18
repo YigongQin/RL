@@ -24,15 +24,18 @@ import subprocess
 import warnings
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
-from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping
+from typing import TYPE_CHECKING, Any, Literal, Mapping
 
 from packaging.version import Version
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy import PolicyConfig
 
-# TE MXFP8 grouped MoE inference (Megatron-LM PR #6933) and batch-invariant follow-ups.
-MEGATRON_CORE_MIN_COMMIT_SHA = "34a51b187ff8922e56efdad49df99983e421b610"
+# Merged selective inference precision baseline (Megatron-LM #7300). Use the
+# mainline squash commit: development-branch SHAs do not survive squash merges.
+# MXFP8 batch invariance additionally requires the consolidated #7302 changes;
+# MCore validates the supported training/inference combinations during setup.
+MEGATRON_CORE_MIN_COMMIT_SHA = "c101330a9f9e15381a22cce894674b03084c6a41"
 
 TRANSFORMER_ENGINE_MIN_VERSION = Version("2.18")
 FLASH_ATTN_MIN_VERSION = Version("2.8.1")
@@ -235,14 +238,12 @@ def configure_zero_train_gen_mismatch(
     config: PolicyConfig,
     *,
     apply_kernels: bool,
-    register_moe_bi_fp8_skip: Callable[[], None],
 ) -> None:
-    """Resolve, register Megatron config patch, validate, optionally enable kernels."""
+    """Resolve defaults, validate, and optionally enable MCore kernels."""
     if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
         return
 
     resolve_zero_train_gen_mismatch(config)
-    register_moe_bi_fp8_skip()
 
     result = validate_zero_train_gen_mismatch(
         config,

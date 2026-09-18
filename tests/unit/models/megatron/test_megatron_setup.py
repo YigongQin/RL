@@ -4535,7 +4535,6 @@ def _stub_zero_kl_patches():
         patch(
             "nemo_rl.models.megatron.zero_train_gen_mismatch.enable_batch_invariant_kernels"
         ),
-        patch("nemo_rl.models.megatron.setup._skip_megatron_moe_bi_fp8_assert"),
     ):
         yield
 
@@ -4612,56 +4611,19 @@ def test_zero_train_gen_mismatch_allows_noncolocated_generation():
     assert config["megatron_cfg"]["batch_invariant_mode"] is True
 
 
-@pytest.mark.parametrize(
-    "message",
-    [
-        "Batch-invariant MoE is bf16-only. Disable fp8/fp4 to use it.",
-        (
-            "Batch-invariant MoE supports bf16, or native TE MXFP8 squared-ReLU "
-            "or SwiGLU experts with the inference-optimized TE grouped-GEMM and "
-            "te_native batch-invariant backends."
-        ),
-        (
-            "Batch-invariant MoE supports bf16, native TE MXFP8 squared-ReLU/"
-            "SwiGLU experts, Torch/vLLM MXFP8 squared-ReLU/SwiGLU experts, or "
-            "FlashInfer MXFP8 squared-ReLU experts with the inference-optimized "
-            "transformer implementation."
-        ),
-    ],
-)
-def test_skip_megatron_moe_bi_fp8_assert_allows_te_path(monkeypatch, message):
-    """Training-path MoE+BI+FP8 skips Megatron's FP8 gate; infopt keeps it."""
-    from types import SimpleNamespace
-
+def test_zero_train_gen_mismatch_preserves_mcore_validation(monkeypatch):
+    """Enabling zero mismatch must not suppress MCore configuration failures."""
     from nemo_rl.models.megatron import setup as megatron_setup
 
-    def raise_moe_bi_fp8_gate(self):
-        raise AssertionError(message)
+    def reject_unsupported_config(self):
+        raise AssertionError("Batch-invariant MoE supports bf16 only in this build")
 
-    megatron_setup._MOE_BI_FP8_ASSERT_SKIPPED = False
     monkeypatch.setattr(
-        megatron_setup.TransformerConfig, "__post_init__", raise_moe_bi_fp8_gate
+        megatron_setup.TransformerConfig, "__post_init__", reject_unsupported_config
     )
-    megatron_setup._skip_megatron_moe_bi_fp8_assert()
-    patched = megatron_setup.TransformerConfig.__post_init__
+    with _stub_zero_kl_patches():
+        megatron_setup.enable_zero_train_gen_kl(_zero_kl_config())
 
-    te_cfg = SimpleNamespace(
-        transformer_impl="transformer_engine",
-        moe_permute_fusion=False,
-        moe_permute_fusion_into_hybridep=False,
-        moe_pad_expert_input_to_capacity=False,
-        moe_pad_experts_for_cuda_graph_inference=False,
-        sequence_packing_scheduler=None,
-    )
-    patched(te_cfg)  # does not raise
-
-    infopt_cfg = SimpleNamespace(
-        transformer_impl="inference_optimized",
-        moe_permute_fusion=False,
-        moe_permute_fusion_into_hybridep=False,
-        moe_pad_expert_input_to_capacity=False,
-        moe_pad_experts_for_cuda_graph_inference=False,
-        sequence_packing_scheduler=None,
-    )
+    assert megatron_setup.TransformerConfig.__post_init__ is reject_unsupported_config
     with pytest.raises(AssertionError, match="Batch-invariant MoE"):
-        patched(infopt_cfg)
+        megatron_setup.TransformerConfig.__post_init__(SimpleNamespace())
