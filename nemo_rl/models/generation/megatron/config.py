@@ -114,6 +114,11 @@ def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]
         # outright, since local CUDA graphs disable the MoE-layer recompute this
         # flag needs.
         "moe_mega_training_forward": False,
+        # Cleared with it, not independently: MCore rejects the opt-in when the
+        # flag it relaxes is off, so inheriting it from a quantized training
+        # config would fail the generation model at config validation while the
+        # training side was perfectly valid.
+        "moe_mega_training_straight_through": False,
         # The dedicated generation workers receive this merge as their
         # megatron_cfg, so the zero-KL resolver and validator cannot otherwise
         # tell a generation config from a training one, and would apply and

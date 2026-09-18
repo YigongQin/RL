@@ -1103,6 +1103,15 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         # recompute pass. Requires selective 'moe' recompute, which is why it
         # sits with the other recompute settings in _apply_recompute_config.
         "moe_mega_training_forward",
+        # Accepts the straight-through gradient a quantized mega training
+        # forward implies. MCore rejects the pairing without it, and rejects the
+        # flag itself at bf16, so it has to reach TransformerConfig either way.
+        "moe_mega_training_straight_through",
+        # Mamba/SSM train-generation parity: False takes the training forward
+        # off the fused mamba_split_conv1d_scan_combined, which no inference
+        # path runs, and onto the mamba_chunk_scan_combined that prefill and
+        # decode both reduce to. Inert for models with no SSM layers.
+        "use_mamba_mem_eff_path",
     ):
         if key in config["megatron_cfg"]:
             setattr(model_cfg, key, config["megatron_cfg"][key])

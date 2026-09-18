@@ -93,12 +93,38 @@ _ZERO_KL_MEGA_TRAIN_ONLY_DEFAULTS: dict[str, Any] = {
     "activation_checkpointing": True,
     "recompute_granularity": "selective",
 }
-_ZERO_KL_MEGA_GENERATION_DEFAULTS: dict[str, Any] = {
-    # The quantized mega precisions are not bitwise-equal to a bf16 TE training
-    # forward, and their weights cannot be rebuilt from the parameters after a
-    # refit. Both rule them out for zero-KL.
-    "inference_mega_precision": "bf16",
-}
+# The mega precisions that can hold zero-KL. Both build the kernel's weights
+# themselves, which is what lets a refit reach the kernel instead of leaving
+# generation on weights snapshotted at construction, and both run the same
+# kernel on the training side, which is what keeps the two forwards bitwise.
+# nvfp4 and fp8_fp4 have neither property: FlashInfer preprocesses and snapshots
+# their weights, so a refit never lands.
+#
+# They differ in the backward. bf16 also matches TransformerEngine's gradient to
+# rounding. mxfp8 does not -- its gradient comes from the bf16 recompute pass, a
+# straight-through estimator -- so it additionally requires
+# moe_mega_training_straight_through, which is the recipe saying it accepts that.
+_ZERO_KL_MEGA_PRECISIONS: tuple[str, ...] = ("bf16", "mxfp8")
+_ZERO_KL_MEGA_DEFAULT_PRECISION = "bf16"
+
+
+def _requested_mega_precision(config: PolicyConfig) -> str:
+    """The megakernel precision the recipe asked for, on either side.
+
+    Read from one place and pushed to both, because the two sides being bitwise
+    depends on them running the same kernel at the same precision -- and a
+    recipe that set only the generation value would look correct while training
+    silently ran bf16.
+    """
+    from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
+
+    if config.get("generation") is None:
+        # A merged generation config is resolved as a megatron_cfg of its own,
+        # and a colocated policy has no generation section; both carry it inline.
+        precision = config["megatron_cfg"].get("inference_mega_precision")
+    else:
+        precision = merged_inference_megatron_cfg(config).get("inference_mega_precision")
+    return precision or _ZERO_KL_MEGA_DEFAULT_PRECISION
 
 
 @dataclass
@@ -138,7 +164,15 @@ def resolve_zero_train_gen_mismatch(config: PolicyConfig) -> None:
             )
         )
     if mega_backend_selected(config):
+        precision = _requested_mega_precision(config)
         defaults.append((mc, "policy.megatron_cfg", _ZERO_KL_MEGA_MEGATRON_DEFAULTS))
+        # Pushed to the training side as well as the generation side. MCore
+        # validates moe_mega_training_forward against the training config's own
+        # precision, so a training side left at the bf16 default would run a
+        # different kernel from generation and quietly lose parity.
+        defaults.append(
+            (mc, "policy.megatron_cfg", {"inference_mega_precision": precision})
+        )
         # Guarded like the generation block above: a colocated config, or the
         # merged config a dedicated generation worker is resolved against, may
         # carry no generation section at all.
@@ -147,13 +181,24 @@ def resolve_zero_train_gen_mismatch(config: PolicyConfig) -> None:
                 (
                     generation["mcore_generation_config"],
                     "policy.generation.mcore_generation_config",
-                    _ZERO_KL_MEGA_GENERATION_DEFAULTS,
+                    {"inference_mega_precision": precision},
                 )
             )
         if not mc.get("is_inference_model"):
             defaults.append(
                 (mc, "policy.megatron_cfg", _ZERO_KL_MEGA_TRAIN_ONLY_DEFAULTS)
             )
+            if precision != _ZERO_KL_MEGA_DEFAULT_PRECISION:
+                # MCore rejects a quantized mega training forward without this,
+                # and rejects the flag itself at bf16, so it cannot be a blanket
+                # default on either side.
+                defaults.append(
+                    (
+                        mc,
+                        "policy.megatron_cfg",
+                        {"moe_mega_training_straight_through": True},
+                    )
+                )
             # Appended rather than assigned: recompute_modules is a list the
             # recipe may already use for memory, and dropping its entries to add
             # ours would silently raise activation memory.
@@ -368,13 +413,41 @@ def _validate_mega_backend(
             "train/generation mismatch this mode removes."
         )
     precision = inference_cfg.get("inference_mega_precision")
-    if precision != "bf16":
+    if precision not in _ZERO_KL_MEGA_PRECISIONS:
         out.violations.append(
-            "zero_train_gen_mismatch requires inference_mega_precision='bf16' "
-            f"(got {precision!r}). The quantized megakernel precisions are not "
-            "bitwise-equal to the bf16 TransformerEngine training forward, and "
-            "their weights cannot be refreshed after a refit."
+            "zero_train_gen_mismatch requires inference_mega_precision in "
+            f"{list(_ZERO_KL_MEGA_PRECISIONS)} (got {precision!r}). FlashInfer "
+            "preprocesses and snapshots the other precisions' weights, so a refit "
+            "never reaches the kernel and generation keeps sampling from the "
+            "previous step's policy with nothing to show for it."
         )
+    elif trains:
+        # Both sides must run the same kernel at the same precision or the
+        # forwards are not bitwise, which is the entire point of this mode.
+        train_precision = (
+            megatron_cfg.get("inference_mega_precision") or _ZERO_KL_MEGA_DEFAULT_PRECISION
+        )
+        if train_precision != precision:
+            out.violations.append(
+                "policy.megatron_cfg.inference_mega_precision="
+                f"{train_precision!r} does not match generation's {precision!r}. "
+                "The training forward and generation would run the megakernel at "
+                "different precisions, so their outputs would not be bitwise equal."
+            )
+        # A quantized forward with a bf16 recomputed backward is a
+        # straight-through estimator. The forward stays bitwise, so parity holds;
+        # what is given up is gradient fidelity, which belongs in the recipe.
+        if precision != _ZERO_KL_MEGA_DEFAULT_PRECISION and not megatron_cfg.get(
+            "moe_mega_training_straight_through"
+        ):
+            out.violations.append(
+                f"inference_mega_precision={precision!r} requires policy."
+                "megatron_cfg.moe_mega_training_straight_through=true. The mega "
+                "forward runs quantized while the backward comes from the bf16 "
+                "recompute pass, so the gradient is that of the bf16 function -- a "
+                "straight-through estimator, with the convergence consequences "
+                "that implies."
+            )
     if trains and (
         megatron_cfg.get("recompute_granularity") != "selective"
         or "moe" not in (megatron_cfg.get("recompute_modules") or [])

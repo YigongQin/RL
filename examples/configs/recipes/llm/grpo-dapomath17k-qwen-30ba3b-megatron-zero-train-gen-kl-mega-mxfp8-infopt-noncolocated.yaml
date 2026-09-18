@@ -1,0 +1,46 @@
+# Qwen3-30B-A3B DAPO 8K — the mega sibling of this recipe, at MXFP8.
+#
+# Identical to the bf16 mega recipe except for the kernel precision, so read
+# that one for the layout, the CUDA-graph reasoning and the token caps. What is
+# different here is the gradient, and it is the only reason this is a separate
+# recipe rather than a flag.
+#
+# Train/generation parity is unaffected. Both sides run the same megakernel at
+# MXFP8 on the same weights, so the two forwards are bitwise identical -- measured
+# at cold=0, warm=0 over repeated launches in
+# tests/unit_tests/inference/test_mega_training_forward.py. Refit reaches the
+# kernel for the same reason it does at bf16: we build the quantized weights
+# ourselves, calling FlashInfer's own quantizer so the bytes match what its
+# preprocessing would have produced, and rewrite them in place.
+#
+# What is given up is gradient fidelity. The mega forward is MXFP8 while the
+# backward comes from the TE bf16 recompute pass, so the gradient is that of the
+# bf16 function rather than of the function that produced the value -- a
+# straight-through estimator. moe_mega_training_straight_through is the recipe
+# accepting that; MCore refuses the pairing without it. Convergence against the
+# bf16 arm is not established, so treat this as an experiment, not a drop-in.
+#
+# Requires: Blackwell (SM100+), and a flashinfer built from the git rev pinned in
+# the mcore extra -- flashinfer.moe_ep is in no published wheel.
+defaults: grpo-dapomath17k-qwen-30ba3b-megatron-zero-train-gen-kl-mega-infopt-noncolocated.yaml
+
+policy:
+  megatron_cfg:
+    # Both sides, and they must agree: resolve_zero_train_gen_mismatch reads the
+    # generation value and pushes it here, and the validator rejects a mismatch,
+    # but spelling both out keeps the invariant visible in the recipe.
+    inference_mega_precision: "mxfp8"
+    # The opt-in for the straight-through gradient described above. Required at
+    # a quantized precision and rejected at bf16, so it belongs with the
+    # precision rather than in the shared parent.
+    moe_mega_training_straight_through: true
+    fp8_cfg:
+      # Stays off, and is not the same MXFP8. This would make TransformerEngine
+      # store expert weights as MXFP8Tensor, which the mega weight packer cannot
+      # read -- MCore rejects the combination outright. The quantization here is
+      # the kernel's own, applied to bf16 parameters.
+      enabled: false
+
+  generation:
+    mcore_generation_config:
+      inference_mega_precision: "mxfp8"

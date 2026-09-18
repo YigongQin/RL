@@ -1,0 +1,170 @@
+# Nemotron-3-Nano-30B-A3B DAPO — non-colocated Megatron inference with zero
+# train/gen KL, on a hybrid Mamba + MoE model.
+#
+# Layout: 2 nodes x 4 GPUs (train node + dedicated inference node), mirroring
+# the Qwen3-30B-A3B zero-KL recipe so the two are comparable.
+#
+# NO MEGAKERNEL HERE, deliberately. The FlashInfer megakernel stacks gate+up
+# into one tensor and applies SwiGLU, and this model's experts are squared ReLU
+# (config.json: mlp_hidden_act='relu2', architectures=['NemotronHForCausalLM']).
+# TransformerConfig rejects the pairing outright -- "flashinfer_mega only
+# implements SwiGLU" -- so the MoE side takes the ordinary batch-invariant
+# grouped-GEMM path that the Qwen bf16 recipe used before the megakernel.
+#
+# That leaves the interesting half. This model's parity problem is the Mamba
+# layers, not the experts: hybrid_override_pattern is
+# 'MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME' -- M mamba, E MoE,
+# * attention -- so roughly half the layers are SSM mixers whose training and
+# inference kernels have never been compared. See the mamba block below, and
+# tests/unit_tests/ssm/test_mamba_train_gen_parity.py in Megatron-LM for what
+# is and is not established.
+#
+# Requires MAMBA_DETERMINISTIC=1 in the launch environment. It is read as an
+# env var when the SSM Triton modules are imported, not as a config field, so
+# it cannot be set from here and setting it late does nothing. MCore asserts on
+# it rather than letting the run proceed unpinned.
+defaults: ../../grpo_math_1B_megatron.yaml
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+  val_at_start: false
+  val_at_end: false
+  val_period: 10
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_max: 0.28
+
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  hf_config_overrides:
+    router_aux_loss_coef: 0
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  logprob_batch_size: 4
+  logprob_chunk_size: 2048 # requires defer_fp32_logits
+  max_total_sequence_length: 10240
+  precision: bfloat16
+  router_replay:
+    enabled: false
+
+  dtensor_cfg:
+    enabled: false
+
+  # Off for two reasons, and the second is the binding one. The usual: packing
+  # changes microbatch composition, so a token's neighbours depend on what else
+  # landed in the batch. The one specific to this model: the unfused Mamba
+  # training path asserts packed_seq_params is None, so use_mamba_mem_eff_path
+  # below and packing cannot both be set. The varlen SSM kernels that would
+  # have supported packing are inference-only and have no backward.
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+
+  optimizer: null
+  scheduler: null
+
+  megatron_cfg:
+    enabled: true
+    # Supplies batch_invariant_mode, attention_backend=flash,
+    # flash_attention_version=4, batch_invariant_backend=te_native and
+    # collective=ordered on the training side, and raw_logprobs plus
+    # enable_chunked_prefill=False on the generation side. Only the
+    # model-specific settings are spelled out below.
+    zero_train_gen_mismatch: true
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    # Batch-invariant mode rejects context parallelism: CP routes through TE's
+    # FA2 kernels directly, which cannot be pinned to FA4.
+    context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 4
+    sequence_parallel: true
+    defer_fp32_logits: true
+    # Required by batch-invariant MoE training outside the inference-optimized
+    # layer spec.
+    moe_token_dispatcher_type: alltoall
+    moe_router_dtype: fp32
+    moe_pad_experts_for_cuda_graph_inference: false
+
+    # --- Mamba / SSM parity -------------------------------------------------
+    # The default fused path runs mamba_split_conv1d_scan_combined, which no
+    # inference path calls: dynamic prefill and the batch-invariant decode
+    # replay both reduce to mamba_chunk_scan_combined. False takes training
+    # onto that same function, which is also the reference the decode tests
+    # already pin against bitwise. Costs activation memory, and forbids
+    # sequence packing above. MCore asserts this is off when
+    # batch_invariant_mode is set on a hybrid model.
+    use_mamba_mem_eff_path: false
+    # Redundant with the zero_train_gen_mismatch default, spelled out because
+    # on this model it additionally selects the buffered decode replay and an
+    # FP32 SSM state cache, which is what makes decode agree with prefill.
+    batch_invariant_mode: true
+
+    activation_checkpointing: true
+    cuda_graph_impl: none
+
+    fp8_cfg:
+      enabled: false
+
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.0
+      adam_beta2: 0.98
+    scheduler:
+      lr_decay_style: constant
+      lr_warmup_iters: 0
+      lr_warmup_init: 1.0e-06
+
+  generation:
+    backend: megatron
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: ${cluster.gpus_per_node}
+        num_nodes: 1
+    max_new_tokens: 8192
+    mcore_generation_config:
+      moe_router_dtype: fp32
+      # Chunked prefill is already forced off by the zero-KL resolver, and this
+      # model gives it a second reason: an SSM carries state across chunk
+      # boundaries, so a scheduler-chosen split becomes an input to the
+      # arithmetic and the scoring pass cannot reproduce it.
+      enable_chunked_prefill: false
+      enable_prefix_caching: false
+      max_tokens: 16384
+      # Eager first. Graph capture is a separate bring-up on a model whose SSM
+      # decode path keeps mutable state caches.
+      cuda_graph_impl: none
+      num_cuda_graphs: 0
+      inference_cuda_graph_scope: none
+      use_cuda_graphs_for_non_decode_steps: false
+      moe_pad_experts_for_cuda_graph_inference: false
+      buffer_size_gb: 20
+      block_size_tokens: 256
+      kv_cache_management_mode: "persist"
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      refit_backend: "nccl"
+
+data:
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: examples/prompts/cot.txt
+
+env:
+  math:
+    math_verify_impl: dapo_math_verify
+    dapo_long_cot: true
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 2

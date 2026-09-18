@@ -162,23 +162,94 @@ def test_resolve_is_idempotent_on_recompute_modules():
     assert config["megatron_cfg"]["recompute_modules"] == ["moe"]
 
 
-def test_resolve_overrides_a_quantized_mega_precision_with_a_warning():
-    """Quantized megakernel precisions are silently wrong here, so they are forced.
+def test_a_precision_without_a_weight_packer_is_rejected_not_rewritten():
+    """nvfp4 is refused rather than quietly turned into bf16.
 
-    They are not bitwise-equal to the bf16 TE training forward, and their
-    weights cannot be rebuilt after a refit, so generation would keep serving
-    pre-refit experts.
+    It used to be forced, from when bf16 was the only precision that worked.
+    Now that mxfp8 is a real choice, silently substituting would mean a recipe
+    asking for one precision could run another and report success -- so the
+    resolver propagates what was asked for and the validator refuses it.
+
+    The refusal is about refit, not accuracy: FlashInfer preprocesses and
+    snapshots nvfp4 weights, so a refit never reaches the kernel and generation
+    keeps sampling from the previous step's policy.
     """
     config = _mega_config()
     config["generation"]["mcore_generation_config"]["inference_mega_precision"] = (
         "nvfp4"
     )
+    resolve_zero_train_gen_mismatch(config)
 
-    with pytest.warns(UserWarning, match="inference_mega_precision"):
-        resolve_zero_train_gen_mismatch(config)
+    assert (
+        config["generation"]["mcore_generation_config"]["inference_mega_precision"]
+        == "nvfp4"
+    )
+    result = validate_zero_train_gen_mismatch(
+        config, check_packages=False, check_platform=False
+    )
+    assert any("inference_mega_precision" in v for v in result.violations)
 
-    inference = config["generation"]["mcore_generation_config"]
-    assert inference["inference_mega_precision"] == "bf16"
+
+def test_resolve_propagates_mxfp8_to_the_training_side():
+    """The precision has to match on both sides or the forwards are not bitwise.
+
+    Only the generation value is written in a recipe; MCore validates the
+    training forward against the training config's own precision, so a training
+    side left at the bf16 default would run a different kernel from generation.
+    """
+    config = _mega_config()
+    config["generation"]["mcore_generation_config"]["inference_mega_precision"] = (
+        "mxfp8"
+    )
+    resolve_zero_train_gen_mismatch(config)
+
+    mc = config["megatron_cfg"]
+    assert mc["inference_mega_precision"] == "mxfp8"
+    # The gradient still comes from the bf16 recompute, which MCore refuses to
+    # pair with a quantized forward unless the recipe has accepted it.
+    assert mc["moe_mega_training_straight_through"] is True
+
+
+def test_bf16_does_not_get_the_straight_through_opt_in():
+    """MCore rejects the flag at bf16, so it must not be set unconditionally."""
+    config = _mega_config()
+    resolve_zero_train_gen_mismatch(config)
+
+    assert not config["megatron_cfg"].get("moe_mega_training_straight_through")
+
+
+def test_mxfp8_without_the_straight_through_opt_in_is_rejected():
+    """The opt-in is the recipe accepting a straight-through gradient."""
+    config = _mega_config()
+    config["generation"]["mcore_generation_config"]["inference_mega_precision"] = (
+        "mxfp8"
+    )
+    resolve_zero_train_gen_mismatch(config)
+    # Undo what the resolver added, standing in for a caller that validates a
+    # hand-built config rather than a resolved one.
+    config["megatron_cfg"]["moe_mega_training_straight_through"] = False
+
+    result = validate_zero_train_gen_mismatch(
+        config, check_packages=False, check_platform=False
+    )
+    assert any(
+        "moe_mega_training_straight_through" in v for v in result.violations
+    ), result.violations
+
+
+def test_a_precision_mismatch_between_the_two_sides_is_rejected():
+    """The failure this guards is silent: parity breaks with no error."""
+    config = _mega_config()
+    config["generation"]["mcore_generation_config"]["inference_mega_precision"] = (
+        "mxfp8"
+    )
+    resolve_zero_train_gen_mismatch(config)
+    config["megatron_cfg"]["inference_mega_precision"] = "bf16"
+
+    result = validate_zero_train_gen_mismatch(
+        config, check_packages=False, check_platform=False
+    )
+    assert any("does not match generation" in v for v in result.violations)
 
 
 def test_resolve_leaves_non_mega_recipes_untouched():
