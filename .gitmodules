@@ -1,8 +1,15 @@
 [submodule "3rdparty/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
-	url = https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
-	branch = main
-	shallow = true
+	# Fork, not NVIDIA-NeMo/Megatron-Bridge. Not because Bridge itself needed
+	# much -- it carries one dependency change -- but because Megatron-LM is
+	# nested inside it, and a nested submodule's URL is only settable in the
+	# repo that declares it. Pointing Megatron-LM at the parity fork therefore
+	# requires forking Bridge too.
+	url = https://github.com/YigongQin/Megatron-Bridge.git
+	branch = yigongq/inf-backend
+	# shallow = true removed deliberately. A shallow submodule clone fetches
+	# only the branch tip, and the tip moves; `git clone --recursive` then
+	# cannot reach the recorded commit and fails for everyone but the author.
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
 	url = https://github.com/NVIDIA-NeMo/Automodel.git

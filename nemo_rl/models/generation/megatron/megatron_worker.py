@@ -31,6 +31,7 @@ from megatron.core.inference.config import (
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import set_decode_expert_padding
+from megatron.core.resharding.copy_services.base import CopyService
 from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
 from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
 from megatron.core.resharding.refit import (
@@ -59,16 +60,44 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
-from nemo_rl.models.generation.megatron.utils import (
-    log_gpu_memory,
-    resolve_torch_dtype,
-)
+from nemo_rl.models.generation.megatron.utils import log_gpu_memory, resolve_torch_dtype
 from nemo_rl.models.megatron.memory_saver import (
     HAVE_TORCH_MEMORY_SAVER,
     pause_inference_weights,
     resume_inference_weights,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+
+
+def _refit_backend_uses_nccl(refit_backend: str) -> bool:
+    """Return whether a refit backend transfers CUDA tensors through NCCL."""
+    return refit_backend in ("nccl", "nccl_m2n")
+
+
+def _create_refit_copy_service(
+    refit_backend: str, group: torch.distributed.ProcessGroup
+) -> CopyService:
+    """Create the configured MCore copy service for a cross-world refit group."""
+    if refit_backend == "nvshmem":
+        # Deferred because importing the service loads optional NVSHMEM bindings.
+        from megatron.core.resharding.copy_services.nvshmem_copy_service import (
+            NVSHMEMCopyService,
+        )
+
+        return NVSHMEMCopyService(group=group)
+    if refit_backend == "nccl_m2n":
+        # Deferred so NeMo RL remains importable with MCore revisions that do
+        # not yet provide the optional native M2N copy service.
+        from megatron.core.resharding.copy_services.nccl_m2n_copy_service import (
+            NCCLM2NCopyService,
+        )
+
+        return NCCLM2NCopyService(group=group)
+    if refit_backend == "nccl":
+        return NCCLCopyService(group=group)
+    if refit_backend == "gloo":
+        return GlooCopyService(group=group)
+    raise ValueError(f"Unsupported Megatron refit backend: {refit_backend!r}")
 
 
 class MegatronGenerationMixin:
@@ -203,6 +232,78 @@ class MegatronGenerationMixin:
         """Inference CUDA graphs captured in this worker process (0 = eager decode)."""
         return len(_CudagraphGlobalRecord.cudagraph_inference_record)
 
+    def _prepare_fp8_inference_linears(self) -> None:
+        """Pad TE linears so FP8/MXFP8 decode (seq_len=1) uses the same GEMM as train.
+
+        Megatron's ``prepare_model_for_fp8_inference`` wraps TE Linear.forward to
+        pad/unpad the sequence dim to the recipe alignment (32 for MXFP8). Without
+        it, decode falls off the TE MXFP8 cuBLAS path the workspace pin targets.
+        Deferred import: only needed when FP8 is enabled.
+        """
+        fp8_cfg = self.cfg.get("megatron_cfg", {}).get("fp8_cfg")
+        if not fp8_cfg or not fp8_cfg.get("enabled", False):
+            return
+        from megatron.core.fp8_utils import prepare_model_for_fp8_inference
+
+        prepare_model_for_fp8_inference(unwrap_model(self.model))
+        print(
+            f"[Rank {self.rank}] wrapped TE linears for FP8 inference padding "
+            f"(recipe={fp8_cfg.get('fp8_recipe')})."
+        )
+
+    def _refresh_te_quantized_weight_cache(self) -> None:
+        """Force TE to recache FP8/MXFP8 packed weights from the live parameters.
+
+        After the first forward, TE Linear sets ``is_first_microbatch=False``.
+        CUDA-graph replay then skips the weight-cache update, so generation keeps
+        the pre-optimizer quantized weights (KL=0 at step 0, nonzero after).
+        The training schedule resets this flag; generation must too, including
+        colocated m-inf where there is no train→gen weight swap.
+        """
+        models = self.model if isinstance(self.model, (list, tuple)) else [self.model]
+        for model in models:
+            unwrapped = unwrap_model(model)
+            # GPTModel.set_is_first_microbatch() is a no-op unless fp8/fp4 is set,
+            # but TE Linear still caches the BF16 weight transpose behind this flag.
+            if hasattr(unwrapped, "set_is_first_microbatch"):
+                unwrapped.set_is_first_microbatch()
+            for module in unwrapped.modules():
+                if hasattr(module, "is_first_microbatch"):
+                    module.is_first_microbatch = True
+
+    def _sync_te_extra_state_after_reshard(self, is_source: bool) -> None:
+        """Copy TE quantizer ``._extra_state`` train→gen after a reshard refit.
+
+        Megatron reshard copies parameters and persistent buffers only. TE FP8
+        amax/scale lives in ``._extra_state`` and otherwise stays stale on the
+        gen replica after the first optimizer step.
+        """
+        if not (
+            hasattr(self, "refit_pg")
+            and hasattr(self, "_get_model_extra_state_dict")
+            and hasattr(self, "_apply_state_dict_to_model")
+        ):
+            return
+
+        payload: dict = {}
+        if is_source:
+            raw = self._get_model_extra_state_dict()
+            for key, value in raw.items():
+                if isinstance(value, torch.Tensor):
+                    payload[key] = value.detach().to("cpu").contiguous()
+                else:
+                    payload[key] = value
+        world = self.refit_pg.size()
+        gathered: list = [None] * world
+        torch.distributed.all_gather_object(gathered, payload, group=self.refit_pg)
+        if is_source:
+            return
+        src_rank = self.refit_pg.rank() - self.refit_dst_rank_offset
+        extra = gathered[src_rank] or {}
+        if not extra:
+            return
+        self._apply_state_dict_to_model(extra, raise_if_key_missing=False)
+
     def _initialize_inference_engine(self, mcore_generation_config: dict) -> None:
         """Initialize the persistent inference engine and client."""
         # TODO: Switch to standardized Megatron API.
@@ -237,7 +338,9 @@ class MegatronGenerationMixin:
 
         # The value may be overwritten by `recompute_kv_cache_after_weight_updates`.
         kv_cache_management_mode = mcore_generation_config["kv_cache_management_mode"]
-        needs_static_kv_pointers = kv_cache_management_mode != "persist"
+        needs_static_kv_pointers = mcore_generation_config.get(
+            "static_kv_memory_pointers", kv_cache_management_mode != "persist"
+        )
 
         materialize_only_last_token_logits = mcore_generation_config[
             "materialize_only_last_token_logits"
@@ -301,7 +404,14 @@ class MegatronGenerationMixin:
             ),
             logging_step_interval=logging_step_interval,
             num_speculative_tokens=num_speculative_tokens,
-            logprobs_mode=mcore_generation_config["logprobs_mode"],
+            # Sampling parameters control token selection, but batch-invariant
+            # generation reports raw model logprobs. Policy scoring mirrors this
+            # contract so parity is independent of temperature/top-k/top-p.
+            logprobs_mode=(
+                "raw_logprobs"
+                if self.cfg["megatron_cfg"].get("batch_invariant_mode")
+                else mcore_generation_config["logprobs_mode"]
+            ),
             max_requests=max_requests,
         )
 
@@ -313,6 +423,7 @@ class MegatronGenerationMixin:
         self.inference_context = DynamicInferenceContext(
             gen_model.config, inference_config
         )
+        self._prepare_fp8_inference_linears()
         self.inference_wrapped_model = GPTInferenceWrapper(
             gen_model, self.inference_context
         )
@@ -576,6 +687,7 @@ class MegatronGenerationMixin:
 
         lang_module = unwrap_model(gen_model)
         lang_module.eval()
+        self._refresh_te_quantized_weight_cache()
 
         rotary_module = getattr(lang_module, "rotary_pos_emb", None)
         if rotary_module is not None and hasattr(
@@ -865,8 +977,8 @@ class MegatronGenerationRefitMixin:
             port: Port for the process group rendezvous.
             world_size: Total world size (train + inference workers).
             rank_offset: Offset for this side's ranks (`train_world_size` for inference).
-            refit_backend: Copy-service backend ("gloo" or "nccl";
-                "nvshmem" is currently broken, see the issue below).
+            refit_backend: Copy-service backend ("gloo", "nccl", or
+                "nccl_m2n"; "nvshmem" is currently broken, see the issue below).
         """
         if refit_backend == "nvshmem":
             warnings.warn(
@@ -917,7 +1029,7 @@ class MegatronGenerationRefitMixin:
         # registered for the cuda device on this cross-world PG. GLOO stays the
         # default backend so the object collectives in `prepare_swap_model_weights`
         # (all_gather_object / broadcast_object_list) keep using CPU tensors.
-        if refit_backend == "nccl":
+        if _refit_backend_uses_nccl(refit_backend):
             from torch.distributed.distributed_c10d import ProcessGroupNCCL
 
             # Ensure the NCCL communicator binds to this rank's own GPU.
@@ -948,17 +1060,9 @@ class MegatronGenerationRefitMixin:
         _world.pg_map[pg] = ("gloo", pg_prefix_store)
         _world.pg_names[pg] = group_name
 
-        if refit_backend == "nvshmem":
-            # Deferred: importing NVSHMEMCopyService loads the optional nvshmem bindings.
-            from megatron.core.resharding.copy_services.nvshmem_copy_service import (
-                NVSHMEMCopyService,
-            )
-
-            self.refit_copy_service = NVSHMEMCopyService(group=self.refit_pg)
-        elif refit_backend == "nccl":
-            self.refit_copy_service = NCCLCopyService(group=self.refit_pg)
-        else:
-            self.refit_copy_service = GlooCopyService(group=self.refit_pg)
+        self.refit_copy_service = _create_refit_copy_service(
+            refit_backend, self.refit_pg
+        )
 
         is_source = rank_offset == 0
         # Cache for later refit calls (swap_weights_via_reshard).
@@ -998,9 +1102,27 @@ class MegatronGenerationRefitMixin:
         Returns:
             True on success.
         """
+        # Distributed optimizer + overlap_param_gather finishes the post-step
+        # param all-gather lazily via training forward pre-hooks. Refit can
+        # otherwise read param.data first and ship a mix of theta_k and
+        # theta_{k-1} to the gen model (step-0 KL ~0, then a persistent
+        # floor). Same gather as colocated _reshard_into_inference_model.
+        if (
+            is_source
+            and getattr(self, "should_disable_forward_pre_hook", False)
+            and self._forward_pre_hook_enabled()
+        ):
+            self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
+
         src_model = self.model if is_source else None
         dst_model = None if is_source else self.model
 
+        # Both sides meet in collectives here and in the extra-state sync below,
+        # so one side arriving late or not at all strands the other with no
+        # output to show for it. These three lines are what tell the two apart
+        # in a log: whichever stage is missing from one side is the mismatch.
+        role = "src" if is_source else "dst"
+        print(f"[Rank {self.rank}] refit {role}: entering swap_model_weights", flush=True)
         swap_model_weights(
             src_model,
             dst_model,
@@ -1009,6 +1131,12 @@ class MegatronGenerationRefitMixin:
             src_rank_offset=0,
             dst_rank_offset=self.refit_dst_rank_offset,
         )
+
+        print(f"[Rank {self.rank}] refit {role}: entering extra-state sync", flush=True)
+        self._sync_te_extra_state_after_reshard(is_source)
+        print(f"[Rank {self.rank}] refit {role}: swap complete", flush=True)
+        if not is_source:
+            self._refresh_te_quantized_weight_cache()
 
         return True
 

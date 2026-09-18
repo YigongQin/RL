@@ -1,0 +1,25 @@
+# Qwen2.5-1.5B — colocated Megatron inference with zero train/gen KL
+defaults: ../../grpo_math_1B_megatron.yaml
+
+grpo:
+  val_at_start: false
+  val_at_end: false
+  val_period: 10
+
+policy:
+  max_total_sequence_length: 1024
+  megatron_cfg:
+    zero_train_gen_mismatch: true
+    moe_permute_fusion: false
+    cuda_graph_impl: none
+    fp8_cfg:
+      enabled: true
+      fp8_recipe: mxfp8
+  generation:
+    backend: megatron
+    colocated:
+      enabled: true
+    mcore_generation_config:
+      logprobs_mode: raw_logprobs
+      use_cuda_graphs_for_non_decode_steps: false
+      enable_chunked_prefill: false

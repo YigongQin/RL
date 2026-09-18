@@ -389,8 +389,38 @@ class MegatronConfig(TypedDict):
     # Options are 'nvls' (requires Hopper+ NVLink) and 'nccl' (fallback for non-NVLS systems).
     inference_moe_token_dispatcher_type: NotRequired[str]
     # Backend for grouped-GEMM during inference-optimized MoE forward.
-    # Options: 'flashinfer', 'torch', 'vllm' (mcore default).
+    # Options: 'flashinfer', 'torch', 'vllm' (mcore default), 'flashinfer_mega'.
+    # 'flashinfer_mega' is the fused expert-parallel megakernel: it owns EP
+    # transport, so inference_moe_token_dispatcher_type does not apply to it.
     inference_grouped_gemm_backend: NotRequired[str]
+    # Precision of the flashinfer_mega kernel.
+    # Options: 'bf16', 'mxfp8', 'nvfp4', 'fp8_fp4'. Only 'bf16' and 'mxfp8'
+    # support refit and moe_mega_training_forward: their kernel weights are
+    # rebuilt from the parameters, while 'nvfp4' and 'fp8_fp4' are quantized
+    # inside FlashInfer's weight preprocessing and snapshotted there.
+    inference_mega_precision: NotRequired[str]
+    # Hard cap on local tokens per EP rank for flashinfer_mega. The kernel
+    # rejects a wider forward rather than falling back, so size it for the
+    # largest prefill chunk a rank can receive.
+    inference_mega_max_tokens_per_rank: NotRequired[int]
+    # Run the *training* MoE forward through the flashinfer_mega kernel while
+    # taking the backward from the TE recompute pass, so the training forward
+    # and generation execute the same kernel. For train/generation parity in
+    # RL, not throughput. Requires recompute_granularity='selective' with
+    # 'moe' in recompute_modules, and inference_mega_precision='bf16' unless
+    # moe_mega_training_straight_through is set.
+    moe_mega_training_forward: NotRequired[bool]
+    # Allow moe_mega_training_forward at a quantized inference_mega_precision
+    # ('mxfp8'). The forward stays bitwise-equal to generation, but the backward
+    # still comes from the bf16 recompute pass, so the gradient is that of the
+    # bf16 function -- a straight-through estimator. An opt-in because that is a
+    # training-recipe decision, not a backend detail. Set automatically by
+    # zero_train_gen_mismatch when a quantized precision is selected.
+    moe_mega_training_straight_through: NotRequired[bool]
+    # Set by merged_inference_megatron_cfg on the config a dedicated generation
+    # model runs with, so code handed a megatron_cfg can tell which side of the
+    # train/generation split it is looking at. Never set in a recipe.
+    is_inference_model: NotRequired[bool]
     # InferenceTopKRouter requires moe_router_num_groups=None
     # (used when transformer_impl='inference_optimized')
     moe_router_num_groups: NotRequired[int | None]
@@ -486,6 +516,24 @@ class MegatronConfig(TypedDict):
     # Supported keys are model-specific, such as freeze_vision_model,
     # freeze_vision_projection, and freeze_language_model.
     freeze_config: NotRequired[dict[str, Any]]
+    # Enable Megatron-Core's batch-invariant kernels for bitwise-identical
+    batch_invariant_mode: NotRequired[bool]
+    # Megatron-Core kernel backend used by batch_invariant_mode. "te_native"
+    # is the performant default; "triton" and "deepgemm" are legacy options.
+    batch_invariant_backend: NotRequired[Literal["deepgemm", "te_native", "triton"]]
+    # Cross-rank EP combine. "ordered" is portable; "multimem" uses NVLS.
+    batch_invariant_collective: NotRequired[Literal["multimem", "ordered"]]
+    # Pin the FlashAttention generation used by both training and inference.
+    # batch_invariant_mode requires version 3 or 4.
+    flash_attention_version: NotRequired[Literal[2, 3, 4] | None]
+    # Mamba/SSM layers only. The memory-efficient path fuses the conv, the scan
+    # and the gated norm into mamba_split_conv1d_scan_combined, which no
+    # inference path runs -- so a train/generation parity run has to turn it off
+    # and take the unfused mamba_chunk_scan_combined that prefill and decode
+    # reduce to. Costs activation memory, and rejects packed sequences.
+    use_mamba_mem_eff_path: NotRequired[bool]
+    # flag to enable zero train/gen KL with generation.backend='megatron'.
+    zero_train_gen_mismatch: NotRequired[bool]
 
 
 class DraftConfigDisabled(TypedDict):

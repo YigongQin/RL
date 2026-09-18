@@ -26,6 +26,7 @@ nemo_rl.models.megatron.setup, focusing on:
 
 import os
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -598,9 +599,7 @@ class TestApplyModelOverrides:
 
     def test_rejects_first_class_megatron_config_conflict(self):
         """A first-class field cannot also be supplied through model_overrides."""
-        from nemo_rl.models.megatron.setup import (
-            _validate_model_override_conflicts,
-        )
+        from nemo_rl.models.megatron.setup import _validate_model_override_conflicts
 
         with pytest.raises(
             ValueError,
@@ -1014,6 +1013,82 @@ class TestApplyPrecisionConfig:
             _apply_precision_config(model_cfg, config, torch.float32)
             assert model_cfg.pipeline_dtype == expected_dtype
 
+    def test_applies_mxfp8_inference_parameter_filters(self):
+        """Mixed-precision parameter filters reach the Megatron model config."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "inference_mxfp8_include_parameters": r".*mlp\.experts\.linear_fc[12]",
+                "inference_mxfp8_exclude_parameters": r".*shared_experts.*",
+            }
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert (
+            model_cfg.inference_mxfp8_include_parameters
+            == r".*mlp\.experts\.linear_fc[12]"
+        )
+        assert model_cfg.inference_mxfp8_exclude_parameters == r".*shared_experts.*"
+
+    def test_colocated_inference_model_applies_generation_filters(self, monkeypatch):
+        """The colocated provider keeps generation-only precision and layer choices."""
+        import nemo_rl.models.megatron.setup as setup
+
+        include_pattern = r".*mlp\.experts\.linear_fc[12]"
+        provider = SimpleNamespace(
+            pipeline_model_parallel_size=1,
+            tensor_model_parallel_size=1,
+            context_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            sequence_parallel=False,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+        )
+
+        def finalize():
+            assert provider.inference_mxfp8_include_parameters == include_pattern
+            assert (
+                provider.transformer_layer_spec
+                is setup._inference_optimized_gpt_layer_spec
+            )
+
+        provider.finalize = MagicMock(side_effect=finalize)
+        inference_model = MagicMock()
+        get_model = MagicMock(return_value=[inference_model])
+        monkeypatch.setattr(setup, "_apply_parallelism_config", lambda *_: None)
+        monkeypatch.setattr(setup, "_apply_moe_config", lambda *_: None)
+        monkeypatch.setattr(
+            setup, "build_inference_pg_collection", lambda *_args, **_kwargs: object()
+        )
+        monkeypatch.setattr(setup, "get_model", get_model)
+        monkeypatch.setattr(setup, "inference_model_alloc_region", MagicMock)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+
+        policy_cfg = {
+            "megatron_cfg": {
+                "transformer_impl": "inference_optimized",
+                "freeze_moe_router": False,
+                "inference_mxfp8_include_parameters": include_pattern,
+            }
+        }
+        megatron_cfg = SimpleNamespace(
+            ddp=object(),
+            dist=SimpleNamespace(use_tp_pp_dp_mapping=False),
+            rng=SimpleNamespace(data_parallel_random_init=False),
+        )
+
+        result = setup.build_inference_model(policy_cfg, megatron_cfg, provider)
+
+        assert result is inference_model
+        provider.finalize.assert_called_once_with()
+        assert get_model.call_args.args[0] is provider
+
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
     def test_loads_te_precision_config_when_configured(
         self, mock_load_recipe, tmp_path
@@ -1098,6 +1173,100 @@ class TestApplyPrecisionConfig:
         with (
             pytest.warns(UserWarning, match="fp8_cfg"),
             pytest.raises(ValueError, match="mixed FP8 precision recipes"),
+        ):
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    def test_te_precision_config_allows_fp8_param_matching_fp8_cfg(
+        self, mock_load_recipe, tmp_path
+    ):
+        """A quantized module must repeat fp8_param to keep FP8 primary weights."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text("{}")
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        recipe = self._quant_recipe(
+            {
+                "mxfp8": {
+                    "training_recipe": {
+                        "fp8_quantization_recipe": "mxfp8",
+                        "fp8_param": True,
+                    },
+                    "evaluation_recipe": {},
+                }
+            }
+        )
+        mock_load_recipe.return_value = recipe
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "te_precision_config_file": str(recipe_file),
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8", "fp8_param": True},
+            }
+        }
+
+        with pytest.warns(UserWarning, match="fp8_cfg"):
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.quant_recipe is recipe
+
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    def test_te_precision_config_rejects_fp8_param_without_fp8_cfg_param(
+        self, mock_load_recipe, tmp_path
+    ):
+        """Per-module FP8 storage cannot diverge from the fp8_cfg NeMo-RL derives from."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text("{}")
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        mock_load_recipe.return_value = self._quant_recipe(
+            {
+                "mxfp8": {
+                    "training_recipe": {
+                        "fp8_quantization_recipe": "mxfp8",
+                        "fp8_param": True,
+                    }
+                }
+            }
+        )
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "te_precision_config_file": str(recipe_file),
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8", "fp8_param": False},
+            }
+        }
+
+        with (
+            pytest.warns(UserWarning, match="fp8_cfg"),
+            pytest.raises(ValueError, match="fp8_cfg.fp8_param is not enabled"),
+        ):
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    def test_te_precision_config_rejects_fp4_param(self, mock_load_recipe, tmp_path):
+        """FP4 primary weights stay unsupported regardless of fp8_cfg."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text("{}")
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        mock_load_recipe.return_value = self._quant_recipe(
+            {"fp4": {"training_recipe": {"fp4_param": True}}}
+        )
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "te_precision_config_file": str(recipe_file),
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8", "fp8_param": True},
+            }
+        }
+
+        with (
+            pytest.warns(UserWarning, match="fp8_cfg"),
+            pytest.raises(ValueError, match="sets fp4_param"),
         ):
             _apply_precision_config(model_cfg, config, torch.bfloat16)
 
@@ -1306,6 +1475,57 @@ class TestApplyPerformanceConfig:
             CudaGraphModule.mlp,
         ]
         assert model_cfg.cuda_graph_warmup_steps == 3
+
+    def test_batch_invariant_fields_are_forwarded(self):
+        """Batch-invariant settings reach the Megatron model provider."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(gated_linear_unit=True)
+        config = self._config(attention_backend="flash")
+        config["megatron_cfg"].update(
+            {
+                "batch_invariant_mode": True,
+                "batch_invariant_backend": "triton",
+                "batch_invariant_collective": "multimem",
+                "flash_attention_version": 3,
+            }
+        )
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.batch_invariant_mode is True
+        assert model_cfg.batch_invariant_backend == "triton"
+        assert model_cfg.batch_invariant_collective == "multimem"
+        assert model_cfg.flash_attention_version == 3
+
+    def test_inference_optimized_assigns_gpt_layer_spec_hook(self):
+        """transformer_impl=inference_optimized overrides Bridge's TE-only layer spec."""
+        from nemo_rl.models.megatron.setup import (
+            _apply_performance_config,
+            _inference_optimized_gpt_layer_spec,
+        )
+
+        model_cfg = SimpleNamespace(gated_linear_unit=True)
+        config = self._config()
+        config["megatron_cfg"]["transformer_impl"] = "inference_optimized"
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.transformer_impl == "inference_optimized"
+        assert model_cfg.transformer_layer_spec is _inference_optimized_gpt_layer_spec
+
+    def test_transformer_engine_impl_does_not_assign_infopt_layer_spec(self):
+        """TE transformer_impl leaves the provider layer spec untouched."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(gated_linear_unit=True)
+        config = self._config()
+        config["megatron_cfg"]["transformer_impl"] = "transformer_engine"
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.transformer_impl == "transformer_engine"
+        assert not hasattr(model_cfg, "transformer_layer_spec")
 
     def test_omitted_cuda_graph_training_values_preserve_model_config(self):
         """Omitted training CUDA Graph settings retain Megatron-Core values."""
@@ -2665,6 +2885,240 @@ class TestValidateAndSetConfig:
                 assert runtime_config.is_generation_colocated is colocated
                 assert runtime_config.offload_optimizer_for_refit is True
                 assert os.environ.get("NCCL_CUMEM_ENABLE") == expected_cumem
+                assert runtime_config.sampling_params is not None
+
+    def test_batch_invariant_mode_recomputes_raw_logprobs(self):
+        """Sampling parameters select tokens but do not process policy logprobs."""
+        from nemo_rl.models.megatron.setup import validate_and_set_config
+
+        config = {
+            "generation": {
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "top_k": None,
+                "colocated": {"enabled": True},
+            },
+            "precision": "bfloat16",
+            "megatron_cfg": {
+                "batch_invariant_mode": True,
+                "optimizer": {"optimizer_cpu_offload": False},
+                "tensor_model_parallel_size": 2,
+            },
+            "offload_optimizer_for_logprob": False,
+        }
+
+        with (
+            patch("nemo_rl.models.megatron.setup.setup_model_config") as setup_config,
+            patch(
+                "nemo_rl.models.megatron.setup.calculate_padded_vocab_size",
+                return_value=32000,
+            ),
+        ):
+            megatron_cfg = MagicMock()
+            megatron_cfg.model.vocab_size = 32000
+            setup_config.return_value = (megatron_cfg, MagicMock())
+
+            runtime_config = validate_and_set_config(
+                config=config,
+                rank=0,
+                hf_model_name="test-model",
+                pretrained_path="/path/to/model",
+                weights_path=None,
+                optimizer_path=None,
+            )
+
+        assert runtime_config.sampling_params is None
+
+
+@pytest.mark.mcore
+class TestBatchInvariantMode:
+    """Tests for early batch-invariant activation and validation."""
+
+    @staticmethod
+    def _config() -> dict[str, Any]:
+        return {
+            "precision": "bfloat16",
+            "megatron_cfg": {
+                "batch_invariant_mode": True,
+                "batch_invariant_backend": "te_native",
+                "batch_invariant_collective": "ordered",
+                "flash_attention_version": 3,
+                "attention_backend": "flash",
+                "tensor_model_parallel_size": 1,
+                "context_parallel_size": 1,
+                "use_fused_linear_logprobs": False,
+            },
+            "generation": {
+                "backend": "megatron",
+                "temperature": 1.0,
+                "top_k": None,
+                "top_p": 1.0,
+                "mcore_generation_config": {},
+            },
+        }
+
+    def test_enables_selected_mcore_backend(self):
+        """A valid config activates the requested MCore backend."""
+        from nemo_rl.models.megatron.setup import enable_batch_invariant_mode
+
+        support_check = (
+            "megatron.core.transformer.custom_layers.batch_invariant_kernels."
+            "assert_te_supports_batch_invariant_attention"
+        )
+        with (
+            patch(
+                "megatron.core.transformer.custom_layers.batch_invariant_kernels.enable_batch_invariant_mode"
+            ) as enable_mcore,
+            patch(support_check) as assert_te_support,
+        ):
+            enable_batch_invariant_mode(self._config())
+
+        assert_te_support.assert_called_once_with()
+        enable_mcore.assert_called_once_with(backend="te_native", collective="ordered")
+
+    @pytest.mark.parametrize(
+        "missing_field",
+        [
+            "batch_invariant_backend",
+            "batch_invariant_collective",
+            "flash_attention_version",
+        ],
+    )
+    def test_rejects_missing_required_field(self, missing_field: str):
+        """Mode-specific settings must come from the resolved recipe config."""
+        from nemo_rl.models.megatron.setup import enable_batch_invariant_mode
+
+        config = self._config()
+        config["megatron_cfg"].pop(missing_field)
+
+        with pytest.raises(ValueError, match=missing_field):
+            enable_batch_invariant_mode(config)
+
+    def test_disabled_mode_is_a_noop(self):
+        """Absent opt-in does not activate batch-invariant kernels."""
+        from nemo_rl.models.megatron.setup import enable_batch_invariant_mode
+
+        with patch(
+            "megatron.core.transformer.custom_layers.batch_invariant_kernels.enable_batch_invariant_mode"
+        ) as enable_mcore:
+            enable_batch_invariant_mode({"megatron_cfg": {}})
+
+        enable_mcore.assert_not_called()
+
+    def test_rejects_tensor_parallelism_above_one(self):
+        """TP>1 is out of scope for the current batch-invariant path."""
+        from nemo_rl.models.megatron.setup import enable_batch_invariant_mode
+
+        config = self._config()
+        config["megatron_cfg"]["tensor_model_parallel_size"] = 2
+        config["generation"]["mcore_generation_config"][
+            "tensor_model_parallel_size"
+        ] = 2
+
+        with pytest.raises(ValueError, match="tensor_model_parallel_size=1"):
+            enable_batch_invariant_mode(config)
+
+    def test_rejects_mismatched_tensor_parallelism(self):
+        """Generation TP must still match training when both are set."""
+        from nemo_rl.models.megatron.setup import enable_batch_invariant_mode
+
+        config = self._config()
+        config["generation"]["mcore_generation_config"][
+            "tensor_model_parallel_size"
+        ] = 2
+
+        with pytest.raises(ValueError, match="tensor_model_parallel_size"):
+            enable_batch_invariant_mode(config)
+
+    def test_inference_optimized_requires_bfloat16(self):
+        """BF16 is required for inference_optimized BI, not TE-only recipes."""
+        from nemo_rl.models.megatron.setup import enable_batch_invariant_mode
+
+        config = self._config()
+        config["precision"] = "float16"
+        config["generation"]["mcore_generation_config"]["transformer_impl"] = (
+            "inference_optimized"
+        )
+
+        with pytest.raises(ValueError, match="inference_optimized"):
+            enable_batch_invariant_mode(config)
+
+    def test_transformer_engine_allows_non_bf16_policy_precision(self):
+        """TE BI does not gate on policy.precision (MCore checks params_dtype)."""
+        from nemo_rl.models.megatron.setup import enable_batch_invariant_mode
+
+        config = self._config()
+        config["precision"] = "float16"
+        config["generation"]["mcore_generation_config"]["transformer_impl"] = (
+            "transformer_engine"
+        )
+
+        support_check = (
+            "megatron.core.transformer.custom_layers.batch_invariant_kernels."
+            "assert_te_supports_batch_invariant_attention"
+        )
+        with (
+            patch(
+                "megatron.core.transformer.custom_layers.batch_invariant_kernels.enable_batch_invariant_mode"
+            ) as enable_mcore,
+            patch(support_check),
+        ):
+            enable_batch_invariant_mode(config)
+
+        enable_mcore.assert_called_once_with(backend="te_native", collective="ordered")
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("temperature", 0.7),
+            ("top_k", 32),
+            ("top_p", 0.9),
+        ],
+    )
+    def test_supports_sampling_parameters(self, field: str, value: Any):
+        """Sampling and raw-logprob parity are independent contracts."""
+        from nemo_rl.models.megatron.setup import enable_batch_invariant_mode
+
+        config = self._config()
+        config["generation"][field] = value
+
+        support_check = (
+            "megatron.core.transformer.custom_layers.batch_invariant_kernels."
+            "assert_te_supports_batch_invariant_attention"
+        )
+        with (
+            patch(
+                "megatron.core.transformer.custom_layers.batch_invariant_kernels.enable_batch_invariant_mode"
+            ) as enable_mcore,
+            patch(support_check),
+        ):
+            enable_batch_invariant_mode(config)
+
+        enable_mcore.assert_called_once_with(backend="te_native", collective="ordered")
+
+    @pytest.mark.parametrize(
+        ("section", "field", "value", "error"),
+        [
+            ("generation", "backend", "vllm", "generation.backend='megatron'"),
+            (
+                "megatron_cfg",
+                "use_fused_linear_logprobs",
+                True,
+                "incompatible with use_fused_linear_logprobs",
+            ),
+        ],
+    )
+    def test_rejects_non_exact_configurations(
+        self, section: str, field: str, value: Any, error: str
+    ) -> None:
+        """Unsupported topology choices fail before CUDA setup."""
+        from nemo_rl.models.megatron.setup import enable_batch_invariant_mode
+
+        config = self._config()
+        config[section][field] = value
+
+        with pytest.raises(ValueError, match=error):
+            enable_batch_invariant_mode(config)
 
 
 @pytest.mark.mcore
@@ -4040,3 +4494,174 @@ class TestForceSyncOptimizerFp32FromModel:
                 f"DistributedOptimizer no longer references {name!r}; "
                 "_force_sync_optimizer_fp32_from_model's level-1 sync is now a silent no-op."
             )
+
+
+def _zero_kl_config(megatron_cfg=None, mcore_generation_config=None, colocated=True):
+    return {
+        "model_name": "Qwen/Qwen3-30B-A3B",
+        "precision": "bfloat16",
+        "megatron_cfg": {
+            "zero_train_gen_mismatch": True,
+            "moe_permute_fusion": False,
+            "context_parallel_size": 1,
+            **(megatron_cfg or {}),
+        },
+        "generation": {
+            "backend": "megatron",
+            "colocated": {"enabled": colocated},
+            "mcore_generation_config": {
+                "enable_chunked_prefill": False,
+                **(mcore_generation_config or {}),
+            },
+        },
+    }
+
+
+@contextmanager
+def _stub_zero_kl_patches():
+    """Stub validation/kernels so only config resolution is exercised."""
+    from nemo_rl.models.megatron.zero_train_gen_mismatch import ZeroTrainGenValidation
+
+    noop = ZeroTrainGenValidation()
+    with (
+        patch(
+            "nemo_rl.models.megatron.zero_train_gen_mismatch.validate_zero_train_gen_mismatch",
+            return_value=noop,
+        ),
+        patch(
+            "nemo_rl.models.megatron.zero_train_gen_mismatch.validate_batch_invariant_mode",
+            return_value=noop,
+        ),
+        patch(
+            "nemo_rl.models.megatron.zero_train_gen_mismatch.enable_batch_invariant_kernels"
+        ),
+        patch("nemo_rl.models.megatron.setup._skip_megatron_moe_bi_fp8_assert"),
+    ):
+        yield
+
+
+def test_zero_train_gen_mismatch_preserves_generation_transformer_impl():
+    """Zero-KL does not force TE; recipes may keep inference_optimized."""
+    from nemo_rl.models.megatron.setup import enable_zero_train_gen_kl
+
+    config = _zero_kl_config(
+        mcore_generation_config={"transformer_impl": "inference_optimized"}
+    )
+
+    with _stub_zero_kl_patches():
+        enable_zero_train_gen_kl(config)
+
+    mcore_generation_config = config["generation"]["mcore_generation_config"]
+    assert mcore_generation_config["transformer_impl"] == "inference_optimized"
+    assert mcore_generation_config["logprobs_mode"] == "raw_logprobs"
+    assert mcore_generation_config["enable_chunked_prefill"] is False
+    assert config["megatron_cfg"]["batch_invariant_mode"] is True
+    assert config["megatron_cfg"]["moe_permute_fusion"] is False
+    assert config["megatron_cfg"]["attention_backend"] == "flash"
+    assert config["megatron_cfg"]["flash_attention_version"] == 4
+    assert config["megatron_cfg"]["batch_invariant_backend"] == "te_native"
+    assert config["megatron_cfg"]["batch_invariant_collective"] == "ordered"
+
+
+def test_zero_train_gen_mismatch_warns_on_conflicting_knobs():
+    """Conflicting zero-KL knobs are overridden with a warning."""
+    from nemo_rl.models.megatron.setup import enable_zero_train_gen_kl
+
+    config = _zero_kl_config(
+        megatron_cfg={"moe_permute_fusion": True},
+        mcore_generation_config={"enable_chunked_prefill": True},
+    )
+
+    with _stub_zero_kl_patches():
+        with pytest.warns(
+            UserWarning, match="moe_permute_fusion|enable_chunked_prefill"
+        ):
+            enable_zero_train_gen_kl(config)
+
+    assert config["megatron_cfg"]["moe_permute_fusion"] is False
+    assert (
+        config["generation"]["mcore_generation_config"]["enable_chunked_prefill"]
+        is False
+    )
+
+
+def test_zero_train_gen_mismatch_enables_batch_invariant_mode():
+    """Zero train/gen mismatch must force batch_invariant_mode and eager permute."""
+    from nemo_rl.models.megatron.setup import enable_zero_train_gen_kl
+
+    # CUDA graphs stay under recipe control, so an explicit value must survive.
+    config = _zero_kl_config(megatron_cfg={"cuda_graph_impl": "local"})
+
+    with _stub_zero_kl_patches():
+        enable_zero_train_gen_kl(config)
+
+    assert config["megatron_cfg"]["batch_invariant_mode"] is True
+    assert config["megatron_cfg"]["moe_permute_fusion"] is False
+    assert config["megatron_cfg"]["cuda_graph_impl"] == "local"
+
+
+def test_zero_train_gen_mismatch_allows_noncolocated_generation():
+    """Non-colocated Megatron generation is allowed for zero-KL."""
+    from nemo_rl.models.megatron.setup import enable_zero_train_gen_kl
+
+    config = _zero_kl_config(colocated=False)
+    with _stub_zero_kl_patches():
+        enable_zero_train_gen_kl(config)
+
+    assert config["generation"]["colocated"]["enabled"] is False
+    assert config["megatron_cfg"]["batch_invariant_mode"] is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Batch-invariant MoE is bf16-only. Disable fp8/fp4 to use it.",
+        (
+            "Batch-invariant MoE supports bf16, or native TE MXFP8 squared-ReLU "
+            "or SwiGLU experts with the inference-optimized TE grouped-GEMM and "
+            "te_native batch-invariant backends."
+        ),
+        (
+            "Batch-invariant MoE supports bf16, native TE MXFP8 squared-ReLU/"
+            "SwiGLU experts, Torch/vLLM MXFP8 squared-ReLU/SwiGLU experts, or "
+            "FlashInfer MXFP8 squared-ReLU experts with the inference-optimized "
+            "transformer implementation."
+        ),
+    ],
+)
+def test_skip_megatron_moe_bi_fp8_assert_allows_te_path(monkeypatch, message):
+    """Training-path MoE+BI+FP8 skips Megatron's FP8 gate; infopt keeps it."""
+    from types import SimpleNamespace
+
+    from nemo_rl.models.megatron import setup as megatron_setup
+
+    def raise_moe_bi_fp8_gate(self):
+        raise AssertionError(message)
+
+    megatron_setup._MOE_BI_FP8_ASSERT_SKIPPED = False
+    monkeypatch.setattr(
+        megatron_setup.TransformerConfig, "__post_init__", raise_moe_bi_fp8_gate
+    )
+    megatron_setup._skip_megatron_moe_bi_fp8_assert()
+    patched = megatron_setup.TransformerConfig.__post_init__
+
+    te_cfg = SimpleNamespace(
+        transformer_impl="transformer_engine",
+        moe_permute_fusion=False,
+        moe_permute_fusion_into_hybridep=False,
+        moe_pad_expert_input_to_capacity=False,
+        moe_pad_experts_for_cuda_graph_inference=False,
+        sequence_packing_scheduler=None,
+    )
+    patched(te_cfg)  # does not raise
+
+    infopt_cfg = SimpleNamespace(
+        transformer_impl="inference_optimized",
+        moe_permute_fusion=False,
+        moe_permute_fusion_into_hybridep=False,
+        moe_pad_expert_input_to_capacity=False,
+        moe_pad_experts_for_cuda_graph_inference=False,
+        sequence_packing_scheduler=None,
+    )
+    with pytest.raises(AssertionError, match="Batch-invariant MoE"):
+        patched(infopt_cfg)
