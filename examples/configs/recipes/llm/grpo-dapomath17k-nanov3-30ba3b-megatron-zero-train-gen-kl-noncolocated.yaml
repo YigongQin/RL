@@ -91,6 +91,25 @@ policy:
     moe_router_dtype: fp32
     moe_pad_experts_for_cuda_graph_inference: false
 
+    # --- Squared-ReLU experts ----------------------------------------------
+    # This model's experts are squared ReLU, not SwiGLU, and the two flags
+    # below both follow from that.
+    #
+    # bias_activation_fusion is True in the inherited base config and
+    # TransformerConfig rejects it outright for any activation other than
+    # gelu/silu/quick_gelu, so the worker cannot even construct without this.
+    # It gates the dense MLP path, not the grouped MoE one, so turning it off
+    # does not move the experts onto different arithmetic.
+    bias_activation_fusion: false
+    # Parity, not performance. The batch-invariant inference kernel
+    # (inference/moe/batch_invariant.py::squared_relu_with_probs) is written to
+    # reproduce the *fused* weighted_squared_relu bit for bit, down to
+    # squaring a BF16-materialized ReLU output. The base config leaves this
+    # false, which sends training down the unfused branch in experts.py with a
+    # different rounding sequence -- same math, different result, and nothing
+    # would report it beyond a nonzero KL.
+    use_fused_weighted_squared_relu: true
+
     # --- Mamba / SSM parity -------------------------------------------------
     # The default fused path runs mamba_split_conv1d_scan_combined, which no
     # inference path calls: dynamic prefill and the batch-invariant decode
@@ -130,7 +149,22 @@ policy:
         num_nodes: 1
     max_new_tokens: 8192
     mcore_generation_config:
+      # Required by the zero-KL validator, which rejects an unset value rather
+      # than defaulting -- the generation stack has to be a stated choice.
+      transformer_impl: "inference_optimized"
       moe_router_dtype: fp32
+      # Stated rather than inherited: the base config asks for
+      # processed_logprobs and the resolver overrides it, which is correct but
+      # shows up as a warning that reads like a mistake. Post-processing the
+      # logprobs is exactly the mismatch being removed.
+      logprobs_mode: raw_logprobs
+      # The MoE half, matching the proven non-mega zero-KL arm. This pairing is
+      # the invariant: training keeps TE's native grouped GEMM under
+      # batch_invariant_backend=te_native, and the vLLM fused MoE is the
+      # inference side that agrees with it. Swapping either one alone
+      # reintroduces the mismatch this recipe exists to remove.
+      inference_grouped_gemm_backend: "vllm"
+      inference_moe_token_dispatcher_type: "nvls"
       # Chunked prefill is already forced off by the zero-KL resolver, and this
       # model gives it a second reason: an SSM carries state across chunk
       # boundaries, so a scheduler-chosen split becomes an input to the
@@ -140,10 +174,10 @@ policy:
       max_tokens: 16384
       # Eager first. Graph capture is a separate bring-up on a model whose SSM
       # decode path keeps mutable state caches.
-      cuda_graph_impl: none
-      num_cuda_graphs: 0
-      inference_cuda_graph_scope: none
-      use_cuda_graphs_for_non_decode_steps: false
+      cuda_graph_impl: local
+      num_cuda_graphs: -1
+      inference_cuda_graph_scope: block
+      use_cuda_graphs_for_non_decode_steps: true
       moe_pad_experts_for_cuda_graph_inference: false
       buffer_size_gb: 20
       block_size_tokens: 256

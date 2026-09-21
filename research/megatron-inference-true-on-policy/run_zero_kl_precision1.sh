@@ -216,6 +216,24 @@ case "${MODEL}" in
         ISL="${ISL:-10240}"
         NVSHMEM_REFIT="false"
         ;;
+    nanov3-infopt|nanov3-30ba3b-infopt)
+        STACK="infopt"
+        RUN_PREFIX="nanov3-infopt"
+        GRPO_CONFIG="examples/configs/recipes/llm/grpo-dapomath17k-nanov3-30ba3b-megatron-zero-train-gen-kl-noncolocated.yaml"
+        SAVE_PERIOD="${SAVE_PERIOD:-35}"
+        DEFAULT_NODES=2
+        ISL="${ISL:-10240}"
+        # NVSHMEM_REFIT left at the default, unlike the mega arms: this recipe
+        # uses the nvls inference dispatcher, which needs the symmetric heap
+        # even though refit itself goes over nccl.
+        #
+        # Hybrid Mamba + MoE, and no megakernel: this model's experts are
+        # squared ReLU (mlp_hidden_act='relu2'), which the megakernel rejects
+        # outright since it stacks gate+up and applies SwiGLU. The MoE half
+        # gets parity from DeepGEMM on both sides instead. The half being
+        # tested here is the SSM layers.
+        MAMBA_PARITY="true"
+        ;;
     *)
         echo "ERROR: MODEL is required." >&2
         echo "  colocated TE+mxfp8:  qwen1.5b, qwen30ba3b" >&2
@@ -225,6 +243,7 @@ case "${MODEL}" in
         echo "  non-colocated torch mxfp8 infopt (A/B): qwen30ba3b-mxfp8-torch-infopt (-N 2)" >&2
         echo "  non-colocated flashinfer megakernel: qwen30ba3b-mega-infopt (-N 2, GB200)" >&2
         echo "  ... the same at MXFP8 (straight-through gradient): qwen30ba3b-mega-mxfp8-infopt" >&2
+        echo "  non-colocated hybrid mamba+MoE (no megakernel): nanov3-infopt (-N 2)" >&2
         exit 1
         ;;
 esac
@@ -427,6 +446,27 @@ export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-10.0 10.3}"
 # looks poisoned; check_flashinfer_arch.py --purge clears it for this arch.
 export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-${RL_DIR}/jit_cache/shared}"
 mkdir -p "${FLASHINFER_WORKSPACE_BASE}"
+
+# SSM determinism, for hybrid models only. The Mamba Triton ops choose their
+# autotune config list inside the @triton.autotune decorator, so the choice is
+# made when megatron.core.ssm is imported and cannot be changed afterwards --
+# which is why this is an environment variable forwarded into the workers
+# rather than a config field. Without it the same token can reduce in a
+# different order at prefill width than at decode width, and train/generation
+# parity is not even in principle available. MCore asserts on it when
+# batch_invariant_mode is set on a hybrid model, so a missing export fails the
+# job at config validation rather than producing quietly wrong numbers.
+MAMBA_EXPORT=""
+if [[ "${MAMBA_PARITY:-false}" == "true" ]]; then
+    export MAMBA_DETERMINISTIC="${MAMBA_DETERMINISTIC:-1}"
+    # Triton >= 3.4 caches autotune results instead of retiming them, which is
+    # how to be deterministic without falling back to the cheapest config;
+    # determinism.py warns when it is unset.
+    export TRITON_CACHE_AUTOTUNING="${TRITON_CACHE_AUTOTUNING:-1}"
+    MAMBA_EXPORT="export MAMBA_DETERMINISTIC=${MAMBA_DETERMINISTIC} && \\
+export TRITON_CACHE_AUTOTUNING=${TRITON_CACHE_AUTOTUNING} && \\
+"
+fi
 export NVTE_WITH_NCCL_EP
 export NVTE_CUDA_ARCHS
 export CONTAINER="${CONTAINER_IMAGE}"
@@ -510,7 +550,7 @@ fi
 export COMMAND="${CACHE_EXPORT}\
 export NEMO_RL_VENV_DIR=${NEMO_RL_VENV_CONTAINER} && \
 export NRL_MINF_SHARED_CLUSTER=${NRL_MINF_SHARED_CLUSTER:-0} && \
-${NVSHMEM_EXPORT}${PARITY_DUMP_EXPORT}${REFIT_TRACE_EXPORT}\
+${NVSHMEM_EXPORT}${PARITY_DUMP_EXPORT}${REFIT_TRACE_EXPORT}${MAMBA_EXPORT}\
 export PYTHONUNBUFFERED=1 && \
 export UV_HTTP_TIMEOUT=900 && \
 export HF_HOME=${HF_HOME} && \
