@@ -47,5 +47,11 @@ code_snapshots*/
 *runtime_env.yaml
 !default_runtime_env.yaml
 
+# Per-user secrets sourced by the research launch scripts: HF_TOKEN,
+# WANDB_API_KEY, and cluster-local paths. Ignored rather than trusted to
+# staging discipline, since `git add -A` in that directory would commit them.
+.env
+**/.env
+
 # Claude Code review memory (local only)
 .claude/review-memory/

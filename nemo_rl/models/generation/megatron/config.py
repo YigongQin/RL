@@ -38,6 +38,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     num_cuda_graphs: int | None
     use_cuda_graphs_for_non_decode_steps: bool
     cuda_graph_impl: str
+    # Layer spec used by Megatron generation.
+    # Options are "transformer_engine" and "inference_optimized".
+    transformer_impl: NotRequired[Literal["transformer_engine", "inference_optimized"]]
     # Inference CUDA-graph scope. Options:
     # - 'none': inference runs in eager mode (no CUDA graphs).
     # - 'layer': graphs are owned at the per-layer boundary (TransformerLayer / MambaLayer).
@@ -48,8 +51,14 @@ class MCoreGenerationSpecificArgs(TypedDict):
     materialize_only_last_token_logits: bool
     enable_chunked_prefill: bool
     enable_prefix_caching: bool
+    # Generation log-probs: "processed_logprobs" (sampling-filtered, default)
+    # or "raw_logprobs" (F.log_softmax of model logits). Zero-KL forces raw.
+    logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
 
-    refit_backend: Literal["gloo", "nccl", "nvshmem"]
+    # Copy-service backend for Megatron weight refit. NCCL M2N is available only
+    # to non-colocated generation because its source and destination meshes must
+    # be disjoint.
+    refit_backend: Literal["gloo", "nccl", "nccl_m2n", "nvshmem"]
     num_speculative_tokens: int
 
     mamba_inference_ssm_states_dtype: NotRequired[str]
@@ -70,6 +79,10 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # FP8/MXFP8 for the dedicated (non-colocated) inference model;
     # merged into its `megatron_cfg` by `merged_inference_megatron_cfg`.
     fp8_cfg: NotRequired[Fp8Config]
+    # Optional parameter-name filters for mixed BF16/MXFP8 inference. The
+    # expressions are matched against Megatron's fully qualified parameter names.
+    inference_mxfp8_include_parameters: NotRequired[str]
+    inference_mxfp8_exclude_parameters: NotRequired[str]
 
 
 class MCoreGenerationConfig(GenerationConfig):
@@ -93,6 +106,24 @@ def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]
         **overrides,
         "activation_checkpointing": False,
         "context_parallel_size": 1,
+        # Train-only, like activation_checkpointing above: it routes the
+        # *training* MoE forward through the megakernel and takes the backward
+        # from a recompute pass. Generation has no backward and reaches the same
+        # kernel through inference_grouped_gemm_backend on its own. Inherited
+        # from training it would also make MCore reject the generation model
+        # outright, since local CUDA graphs disable the MoE-layer recompute this
+        # flag needs.
+        "moe_mega_training_forward": False,
+        # Cleared with it, not independently: MCore rejects the opt-in when the
+        # flag it relaxes is off, so inheriting it from a quantized training
+        # config would fail the generation model at config validation while the
+        # training side was perfectly valid.
+        "moe_mega_training_straight_through": False,
+        # The dedicated generation workers receive this merge as their
+        # megatron_cfg, so the zero-KL resolver and validator cannot otherwise
+        # tell a generation config from a training one, and would apply and
+        # check train-side knobs against generation values.
+        "is_inference_model": True,
     }
     # inference_optimized layers hard-require SP with TP>1. Raise with the
     # config key: the colocated build bypasses validate_and_set_config, so this

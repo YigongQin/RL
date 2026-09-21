@@ -30,12 +30,8 @@ from nemo_rl.weight_sync.collective_weight_synchronizer import (
 )
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
-from nemo_rl.weight_sync.ipc_weight_synchronizer import (
-    IPCWeightSynchronizer,
-)
-from nemo_rl.weight_sync.megatron_weight_synchronizer import (
-    MegatronWeightSynchronizer,
-)
+from nemo_rl.weight_sync.ipc_weight_synchronizer import IPCWeightSynchronizer
+from nemo_rl.weight_sync.megatron_weight_synchronizer import MegatronWeightSynchronizer
 from nemo_rl.weight_sync.nccl_reshard_utils import build_nccl_reshard_refit_info
 from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
     NcclReshardWeightSynchronizer,
@@ -747,7 +743,7 @@ class TestMegatronWeightSynchronizer:
     def test_non_colocated_sync_sequence(self, mock_ray):
         mock_ray.get.side_effect = lambda futures: [True for _ in futures]
         policy = _mock_megatron_policy()
-        gen = _mock_megatron_generation()
+        gen = _mock_megatron_generation(refit_backend="nccl_m2n")
         sync = MegatronWeightSynchronizer(
             policy,
             gen,
@@ -757,8 +753,11 @@ class TestMegatronWeightSynchronizer:
         )
 
         sync.init_communicator()
-        policy.init_collective_mcore_generation.assert_called_once()
-        gen.init_collective.assert_called_once()
+        assert (
+            policy.init_collective_mcore_generation.call_args.kwargs["refit_backend"]
+            == "nccl_m2n"
+        )
+        assert gen.init_collective.call_args.kwargs["refit_backend"] == "nccl_m2n"
 
         assert sync.sync_weights() == {}
         gen.suspend_for_refit.assert_called_once()

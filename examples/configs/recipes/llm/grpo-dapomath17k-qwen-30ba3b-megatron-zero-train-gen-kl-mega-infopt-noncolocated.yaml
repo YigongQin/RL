@@ -1,0 +1,124 @@
+# Qwen3-30B-A3B DAPO 8K — non-colocated Megatron inference with zero train/gen KL,
+# routing the MoE experts through the FlashInfer expert-parallel megakernel.
+#
+# Layout: 2 nodes × 4 GPUs (train node + dedicated inference node).
+#
+# Differs from the vllm-grouped-GEMM sibling in one structural way: the
+# megakernel runs on BOTH sides. Generation calls it for the expert compute, and
+# the training forward calls the same kernel via moe_mega_training_forward,
+# taking its backward from a TE recompute pass. Selecting it for generation
+# alone would be worse than not using it at all -- mega and TE agree only to
+# ~6e-3 relative, so the training forward would no longer reproduce the
+# generation log-probs.
+#
+# Requires: Blackwell (SM100+), and a flashinfer built from the git rev pinned
+# in the mcore extra -- flashinfer.moe_ep is in no published wheel.
+defaults: grpo-dapomath17k-qwen-30ba3b-megatron-zero-train-gen-kl-mxfp8.yaml
+
+policy:
+  megatron_cfg:
+    zero_train_gen_mismatch: true
+    moe_permute_fusion: false
+    expert_model_parallel_size: 4
+    # Forced by resolve_zero_train_gen_mismatch when generation selects
+    # flashinfer_mega; spelled out here because it changes what the training
+    # step does, and a silent default would be the wrong way to learn that.
+    moe_mega_training_forward: true
+    # Training side too, not just generation: the megakernel hangs off
+    # InferenceGroupedMLP, which only this layer spec builds, and the backend
+    # is what selects the megakernel inside it.
+    transformer_impl: "inference_optimized"
+    inference_grouped_gemm_backend: "flashinfer_mega"
+    # Train-side copy of the megakernel knobs. setup.py reads these from
+    # policy.megatron_cfg, so the values under generation.mcore_generation_config
+    # do not reach the training TransformerConfig -- without them the training
+    # forward runs at the Megatron default of 128 tokens per rank and the kernel
+    # rejects the very first microbatch.
+    #
+    # The cap has to cover the widest training-side forward, which is the
+    # log-prob pass at logprob_batch_size (4), not the fwd/bwd microbatch at
+    # train_micro_batch_size (1). tensor_model_parallel_size=1 makes
+    # sequence_parallel inert and expert parallelism shards experts rather than
+    # tokens, so every EP rank sees the whole microbatch: 4 * 10240 = 40960.
+    # run_zero_kl_precision1.sh rescales this with ISL, since the workspace is
+    # allocated per MoE layer and a short run should not pay full-length cost.
+    inference_mega_max_tokens_per_rank: 40960
+    # Must match the generation side or the two forwards stop agreeing.
+    inference_mega_precision: "bf16"
+    # The mega forward saves no intermediates, so the backward comes from
+    # recomputing the MoE layer through the ordinary TE dispatch + grouped GEMM.
+    activation_checkpointing: true
+    recompute_granularity: selective
+    recompute_modules: ["moe"]
+    # Local CUDA graphs capture the MoE layer whole, which disables the
+    # layer-level recompute the backward is built from.
+    cuda_graph_impl: none
+    fp8_cfg:
+      # The megakernel's quantized precisions are not bitwise-equal to a bf16 TE
+      # training forward, and their weights cannot be rebuilt after a refit.
+      enabled: false
+
+  generation:
+    backend: megatron
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: ${cluster.gpus_per_node}
+        num_nodes: 1
+    mcore_generation_config:
+      transformer_impl: "inference_optimized"
+      moe_router_dtype: fp32
+      logprobs_mode: raw_logprobs
+      enable_chunked_prefill: false
+      inference_grouped_gemm_backend: "flashinfer_mega"
+      inference_mega_precision: "bf16"
+      # These two must stay equal, and both are spelled out rather than left to
+      # their defaults because the pairing is the invariant.
+      #
+      # inference_mega_max_tokens_per_rank is a hard workspace cap on local
+      # tokens per EP rank, not a hint: the megakernel raises rather than
+      # falling back or chunking. max_tokens is the engine's active-token
+      # budget, which bounds the widest forward it can issue -- so the cap has
+      # to be at least that, regardless of max_total_sequence_length. Sizing it
+      # off the sequence length instead is wrong the moment a prefill step packs
+      # two requests, and the engine's own default here is 16384
+      # (DynamicInferenceContext.DEFAULT_MAX_TOKENS) rather than the 10240
+      # sequence length. TP=1 with expert-only parallelism means every EP rank
+      # sees the whole token stream, so per-rank equals the budget.
+      #
+      # Raising the pair costs FlashInfer symmetric-heap memory, which scales
+      # with tokens x hidden x topk.
+      max_tokens: 16384
+      inference_mega_max_tokens_per_rank: 16384
+      # Decode-only graphs. The megakernel cannot build its layer or run
+      # warmup() under capture -- both are EP collectives -- so capture has to
+      # be preceded by an eager forward on every EP rank; the adapter raises a
+      # named error rather than hanging if that ordering is ever lost.
+      #
+      # Non-decode steps are captured too. Prefill is where a fresh engine's
+      # first forward happens, so this is the case that can reach the kernel
+      # before any eager pass; if the engine's warmup does not get there first,
+      # the adapter raises a named error about warmup() rather than hanging.
+      #
+      # Safe under refit only because refresh_mega_weights() repacks the
+      # kernel-layout buffer eagerly. A lazy repack sits behind a Python branch
+      # inside the forward, which replay skips entirely, and generation would
+      # serve pre-refit experts with nothing to show for it.
+      cuda_graph_impl: local
+      num_cuda_graphs: -1
+      inference_cuda_graph_scope: block
+      use_cuda_graphs_for_non_decode_steps: true
+      # inference_moe_token_dispatcher_type is deliberately absent: the
+      # megakernel owns EP transport and ignores it.
+      moe_pad_experts_for_cuda_graph_inference: false
+      buffer_size_gb: 20
+      block_size_tokens: 256
+      kv_cache_management_mode: "persist"
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      # use nccl for inter-node communication with IB
+      refit_backend: "nccl"
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 2

@@ -127,8 +127,16 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         with timer_context:
             futures_train = self._policy.swap_weights_via_reshard(is_source=True)
             futures_inference = self._generation.update_weights_from_collective()
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
+            # One ray.get over both sides, senders last. The two sides meet in
+            # collectives inside the swap, so a receiver that dies leaves every
+            # sender blocked in one forever. Fetching the sender futures first
+            # then waits on ranks that can no longer finish, and the receiver's
+            # exception -- the one that says what actually broke -- is never
+            # fetched at all: the refit hangs until the job's time limit with
+            # nothing in the log. ray.get raises as soon as any object in the
+            # list is an error, so this reports the receiver instead.
+            gathered = ray.get(futures_inference + futures_train)
+            results = gathered[: len(futures_inference)]
             if not all(result for result in results if result is not None):
                 raise RuntimeError(
                     "❌ Error: Updating weights for the generation policy failed "

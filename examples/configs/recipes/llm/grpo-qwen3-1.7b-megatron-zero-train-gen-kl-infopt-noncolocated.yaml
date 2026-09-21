@@ -1,0 +1,33 @@
+# Qwen3-1.7B — non-colocated inference_optimized generation with zero train/gen KL
+# Layout: 1 node × 8 GPUs (4 train TE + 4 dedicated infopt gen).
+defaults: ../../grpo_math_1B_megatron.yaml
+
+grpo:
+  val_at_start: false
+  val_at_end: false
+  val_period: 10
+
+policy:
+  model_name: "Qwen/Qwen3-1.7B"
+  max_total_sequence_length: 1024
+  megatron_cfg:
+    zero_train_gen_mismatch: true
+    moe_permute_fusion: false
+    cuda_graph_impl: none
+    mtp_num_layers: 0
+  generation:
+    backend: megatron
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 1
+    mcore_generation_config:
+      transformer_impl: inference_optimized
+      logprobs_mode: raw_logprobs
+      enable_chunked_prefill: false
+      refit_backend: nccl
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
