@@ -410,6 +410,11 @@ class MegatronConfig(TypedDict):
     # 'moe' in recompute_modules, and inference_mega_precision='bf16' unless
     # moe_mega_training_straight_through is set.
     moe_mega_training_forward: NotRequired[bool]
+    # Upper bound on local tokens per EP rank for moe_inference_training_forward
+    # with the NVLS dispatcher (log-prob batch size x max sequence length). Its
+    # symmetric buffers cannot grow, so this is what they are sized for; unset
+    # sizes them from the first microbatch, which breaks on a larger later one.
+    moe_inference_training_max_tokens_per_rank: NotRequired[int]
     # Allow moe_mega_training_forward at a quantized inference_mega_precision
     # ('mxfp8'). The forward stays bitwise-equal to generation, but the backward
     # still comes from the bf16 recompute pass, so the gradient is that of the

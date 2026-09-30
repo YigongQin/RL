@@ -114,6 +114,12 @@ def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]
         # outright, since local CUDA graphs disable the MoE-layer recompute this
         # flag needs.
         "moe_mega_training_forward": False,
+        # The backend-agnostic spelling of the flag above, and cleared for
+        # exactly the same reasons. Both are needed: MCore resolves the mega one
+        # into this one in __post_init__, so clearing only the alias leaves this
+        # set and the generation model still fails validation -- which is how
+        # the squared-ReLU vLLM arm broke while the mega arms were fine.
+        "moe_inference_training_forward": False,
         # Cleared with it, not independently: MCore rejects the opt-in when the
         # flag it relaxes is off, so inheriting it from a quantized training
         # config would fail the generation model at config validation while the

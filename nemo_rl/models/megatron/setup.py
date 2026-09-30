@@ -1103,6 +1103,18 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         # recompute pass. Requires selective 'moe' recompute, which is why it
         # sits with the other recompute settings in _apply_recompute_config.
         "moe_mega_training_forward",
+        # The same thing for the non-mega backends, which is what a squared-ReLU
+        # model has to use: the megakernel implements only SwiGLU. Both spellings
+        # have to be forwarded -- MCore resolves the mega one into this one, so a
+        # recipe that set this and was not forwarded would lose its training
+        # forward silently, leaving TE on one side and the inference kernel on
+        # the other with nothing to report the mismatch but the KL.
+        "moe_inference_training_forward",
+        # Bound on the tokens one rank feeds that training forward. The NVLS
+        # dispatcher's symmetric buffers are allocated once and cannot grow, so
+        # without it they are sized from the first microbatch and the first
+        # larger one fails. Not forwarded means silently back to that.
+        "moe_inference_training_max_tokens_per_rank",
         # Accepts the straight-through gradient a quantized mega training
         # forward implies. MCore rejects the pairing without it, and rejects the
         # flag itself at bf16, so it has to reach TransformerConfig either way.
@@ -1963,6 +1975,10 @@ def build_inference_model(
     inference_provider.recompute_granularity = None
     inference_provider.recompute_method = None
     inference_provider.recompute_num_layers = None
+    # The parity training-forward flags are cleared upstream of here, in
+    # merged_inference_megatron_cfg, which is where generation's megatron_cfg is
+    # assembled. Deliberately not repeated: two places that both clear them
+    # means neither is the one that has to be right.
     if inference_provider.transformer_impl == "inference_optimized":
         inference_provider.moe_pad_experts_for_cuda_graph_inference = False
     # Re-run the deferred MCore post-init (virtual, idempotent).

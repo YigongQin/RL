@@ -92,7 +92,32 @@ def _check_megatron_config(policy_cfg: dict) -> tuple[bool, str | None]:
         skip_weight_load=True,
     )
     runtime.megatron_cfg.validate()
-    return True, None
+
+    # setup.py forwards megatron_cfg keys through an explicit allow-list, so a
+    # key missing from it is dropped without a word. For the training-forward
+    # flags that is invisible at runtime: training keeps running TE while
+    # generation runs the inference kernel, and the only symptom is the nonzero
+    # KL the mode exists to remove. Confirm the value the recipe asked for is
+    # the value the model was built with.
+    model_cfg = runtime.megatron_cfg.model
+    dropped = [
+        flag
+        for flag in ("moe_mega_training_forward", "moe_inference_training_forward")
+        if flag in policy_cfg["megatron_cfg"]
+        and bool(policy_cfg["megatron_cfg"][flag]) is not bool(getattr(model_cfg, flag, False))
+    ]
+    if dropped:
+        raise ValueError(
+            f"policy.megatron_cfg sets {dropped} but the built model config does not "
+            "carry it. Add the flag to the forwarding list in "
+            "nemo_rl/models/megatron/setup.py; without it the training forward "
+            "silently stays on TransformerEngine and the run reports a nonzero KL "
+            "with no other sign of what went wrong."
+        )
+    return True, (
+        "moe_inference_training_forward="
+        f"{getattr(model_cfg, 'moe_inference_training_forward', False)!r}"
+    )
 
 
 def _check_generation_config(policy_cfg: dict) -> tuple[bool, str | None]:
@@ -126,9 +151,16 @@ def _check_generation_config(policy_cfg: dict) -> tuple[bool, str | None]:
     if gen_mcore.get("zero_train_gen_mismatch"):
         enable_zero_train_gen_kl(gen_policy_cfg, apply_kernels=False)
     _check_megatron_config(gen_policy_cfg)
+    # Reported, deliberately not forced. merged_inference_megatron_cfg turns the
+    # training-forward flags off because generation has no backward to recompute
+    # into; setting them here instead would make this check pass for a merge
+    # that forgot to. Jobs 576207 and 577558 died on exactly that omission --
+    # the merge cleared the mega spelling and not the general one.
     return True, (
         f"cuda_graph_impl={gen_mcore.get('cuda_graph_impl', 'none')!r}, "
-        f"moe_mega_training_forward={gen_mcore.get('moe_mega_training_forward', False)!r}"
+        f"moe_mega_training_forward={gen_mcore.get('moe_mega_training_forward', False)!r}, "
+        "moe_inference_training_forward="
+        f"{gen_mcore.get('moe_inference_training_forward', False)!r}"
     )
 
 
