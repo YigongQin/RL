@@ -745,7 +745,17 @@ class MegatronPolicyWorkerImpl(
             return
 
         if zero_grad_buffer:
+            # offload_before_refit has already released the grad storage of the
+            # ordinary (non-shared) buffers, and zero_grad_buffer() fills every
+            # buffer unconditionally: on a released allocation that is a write to
+            # a null pointer. CUDA reports it asynchronously, at the main->param
+            # copy below, which points the investigation at the wrong place.
+            # Bring the grads back first (a no-op for a buffer whose grads were
+            # never released, such as the shared MXFP8 one).
+            self.move_model(self.model, "cuda", move_params=False, move_grads=True)
             self.model.zero_grad_buffer()
+            # Fail here, not at the copy, if the zero itself faulted.
+            torch.cuda.synchronize()
 
         optimizers = (
             self.optimizer.chained_optimizers
@@ -3530,6 +3540,23 @@ class MegatronPolicyWorkerImpl(
             # DDP case
             for buffers in [model.buffers, model.expert_parallel_buffers]:
                 for buffer_idx in range(len(buffers)):
+                    if (
+                        device == "cpu"
+                        and move_grads
+                        and not move_params
+                        and getattr(buffers[buffer_idx], "shared_buffer", None)
+                        is not None
+                    ):
+                        # MXFP8 params (fp8_param) share one allocation with the
+                        # grad buffer, so a grads-only offload also frees the
+                        # params, and Megatron's reload cannot bring them back:
+                        # it restores params only from a CPU copy that the
+                        # grads-first ordering never takes. The log-prob pass and
+                        # the refit then read a released allocation, which CUDA
+                        # reports as an asynchronous illegal memory access far
+                        # from the cause. Keep the shared allocation resident.
+                        # The params have to be on the GPU for both anyway.
+                        continue
                     if device == "cpu":
                         buffers[buffer_idx].offload_to_cpu(
                             move_params=move_params, move_grads=move_grads
