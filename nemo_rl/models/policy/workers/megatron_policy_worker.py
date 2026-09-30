@@ -38,7 +38,11 @@ from megatron.bridge.training.utils.train_utils import (
 )
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
+# Re-exported by Bridge rather than imported from Megatron-Core directly: Core
+# deleted this helper with its in-tree async checkpointing, and Bridge carries
+# the nvrx-only replacement. Importing it from one place keeps the two from
+# disagreeing about which backends exist.
+from megatron.bridge.training.state import get_async_strategy
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV1,
