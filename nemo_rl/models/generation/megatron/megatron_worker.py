@@ -377,6 +377,14 @@ class MegatronGenerationMixin:
             torch.float16,
             torch.bfloat16,
         )
+        # It also does not produce the same bits as the RoPE a policy forward
+        # runs, so it is incompatible with the parity batch-invariant mode
+        # promises. MCore raises on an explicit True there rather than quietly
+        # overriding it, which is the right call but means the choice has to be
+        # made here -- passing None instead would hand MCore the decision and
+        # lose the dtype guard above.
+        if getattr(gen_model.config, "batch_invariant_mode", False):
+            use_flashinfer_fused_rope = False
 
         inference_config = InferenceConfig(
             block_size_tokens=block_size_tokens,
