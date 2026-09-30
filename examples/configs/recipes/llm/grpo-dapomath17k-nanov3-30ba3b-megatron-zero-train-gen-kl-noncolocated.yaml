@@ -54,12 +54,10 @@ policy:
   dtensor_cfg:
     enabled: false
 
-  # Off for two reasons, and the second is the binding one. The usual: packing
-  # changes microbatch composition, so a token's neighbours depend on what else
-  # landed in the batch. The one specific to this model: the unfused Mamba
-  # training path asserts packed_seq_params is None, so use_mamba_mem_eff_path
-  # below and packing cannot both be set. The varlen SSM kernels that would
-  # have supported packing are inference-only and have no backward.
+  # Off: packing changes microbatch composition, so a token's neighbours
+  # depend on what else landed in the batch. (With use_mamba_mem_eff_path
+  # false below, the unfused Mamba training path would additionally reject
+  # packed_seq_params.)
   sequence_packing:
     enabled: false
   dynamic_batching:
@@ -111,14 +109,13 @@ policy:
     use_fused_weighted_squared_relu: true
 
     # --- Mamba / SSM parity -------------------------------------------------
-    # The default fused path runs mamba_split_conv1d_scan_combined, which no
-    # inference path calls: dynamic prefill and the batch-invariant decode
-    # replay both reduce to mamba_chunk_scan_combined. False takes training
-    # onto that same function, which is also the reference the decode tests
-    # already pin against bitwise. Costs activation memory, and forbids
-    # sequence packing above. MCore asserts this is off when
-    # batch_invariant_mode is set on a hybrid model.
-    use_mamba_mem_eff_path: false
+    # True is the default fused path (mamba_split_conv1d_scan_combined), which
+    # saves activation memory. It gates z inside the scan and leaves the norm
+    # ungated, the same arrangement dynamic prefill and the batch-invariant
+    # decode replay use. MCore used to assert this off under batch_invariant_mode
+    # on hybrid models; that assert is gone. Set false to take training onto the
+    # unfused mamba_chunk_scan_combined path (_static_prefill) for an A/B.
+    use_mamba_mem_eff_path: true
     # Redundant with the zero_train_gen_mismatch default, spelled out because
     # on this model it additionally selects the buffered decode replay and an
     # FP32 SSM state cache, which is what makes decode agree with prefill.

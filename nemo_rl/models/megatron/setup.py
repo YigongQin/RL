@@ -1119,10 +1119,9 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         # forward implies. MCore rejects the pairing without it, and rejects the
         # flag itself at bf16, so it has to reach TransformerConfig either way.
         "moe_mega_training_straight_through",
-        # Mamba/SSM train-generation parity: False takes the training forward
-        # off the fused mamba_split_conv1d_scan_combined, which no inference
-        # path runs, and onto the mamba_chunk_scan_combined that prefill and
-        # decode both reduce to. Inert for models with no SSM layers.
+        # Mamba/SSM training path: False takes the training forward off the
+        # fused mamba_split_conv1d_scan_combined and onto the unfused
+        # mamba_chunk_scan_combined. Inert for models with no SSM layers.
         "use_mamba_mem_eff_path",
     ):
         if key in config["megatron_cfg"]:

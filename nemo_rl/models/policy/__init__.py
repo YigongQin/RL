@@ -531,11 +531,10 @@ class MegatronConfig(TypedDict):
     # Pin the FlashAttention generation used by both training and inference.
     # batch_invariant_mode requires version 3 or 4.
     flash_attention_version: NotRequired[Literal[2, 3, 4] | None]
-    # Mamba/SSM layers only. The memory-efficient path fuses the conv, the scan
-    # and the gated norm into mamba_split_conv1d_scan_combined, which no
-    # inference path runs -- so a train/generation parity run has to turn it off
-    # and take the unfused mamba_chunk_scan_combined that prefill and decode
-    # reduce to. Costs activation memory, and rejects packed sequences.
+    # Mamba/SSM layers only. True (MCore's default) is the memory-efficient
+    # fused mamba_split_conv1d_scan_combined; False takes the unfused
+    # mamba_chunk_scan_combined path, which costs activation memory and rejects
+    # packed sequences. Both are allowed under batch_invariant_mode.
     use_mamba_mem_eff_path: NotRequired[bool]
     # flag to enable zero train/gen KL with generation.backend='megatron'.
     zero_train_gen_mismatch: NotRequired[bool]
