@@ -1,0 +1,79 @@
+# Nemotron-H Nano v3 30B-A3B DAPO — non-colocated inference_optimized, MXFP8 MoE experts,
+# with the training forward running the same vLLM grouped-GEMM kernel generation runs.
+#
+# Differs from its bf16 parent in two ways that go together:
+#
+#   1. The experts are MXFP8 on both sides. Generation gets there through refit --
+#      _needs_mxfp8_conversion fires on inference_optimized + fp8 + fp8_recipe=mxfp8 and
+#      quantizes the target decoder's expert weights into MCore MXFP8Tensor buffers.
+#   2. The training forward runs that same kernel on the same bits, via
+#      moe_inference_training_forward. Without it the training side would be TE's MXFP8
+#      grouped GEMM, which is a different kernel from the one generation calls, and the
+#      log-probs would not reproduce generation's.
+#
+# The gradient comes from the TE recompute pass, which under this config is also MXFP8:
+# fp8_param=true means TE holds MXFP8 primary weights, so the recomputed backward is the
+# backward of the same precision the value pass ran. This is NOT the straight-through
+# arrangement the mega-mxfp8 arm uses -- that one pairs an MXFP8 forward with a bf16
+# backward because its quantization lives in the kernel rather than in the parameters.
+# MCore reflects the difference: it demands moe_mega_training_straight_through only for
+# flashinfer_mega, and not here.
+#
+# Requires: Blackwell (SM100+). 2 nodes x 4 GPUs (train node + dedicated inference node).
+defaults: grpo-dapomath17k-nanov3-30ba3b-megatron-zero-train-gen-kl-noncolocated.yaml
+
+policy:
+  megatron_cfg:
+    # MXFP8 on routed experts only; attention and the Mamba mixers stay bf16. Applied to
+    # both sides -- the train/generation forward equality is over these weights, so a
+    # module quantized on one side and not the other would break it.
+    te_precision_config_file: /lustre/fsw/portfolios/coreai/users/yigongq/post-training/RL/examples/configs/te_precision/nanov3-moe-only-mxfp8.yaml
+    fp8_cfg:
+      enabled: true
+      fp8: hybrid
+      fp8_recipe: mxfp8
+      # Required, and not merely a storage choice. It is what puts MXFP8 on the
+      # parameters, which is what both sides key off: refit's _needs_mxfp8_conversion
+      # for generation, and _expert_params_use_te_mxfp8 for the training value pass.
+      # With bf16 parameters both sides quietly fall back to the bf16 kernel.
+      fp8_param: true
+
+    # Training side too, not just generation. The kernel hangs off InferenceGroupedMLP,
+    # which only this layer spec builds, and the backend is what selects vLLM inside it.
+    transformer_impl: "inference_optimized"
+    inference_grouped_gemm_backend: "vllm"
+    # The opt-in for running the inference kernel in the training value pass. Spelled out
+    # because it changes what the training step computes.
+    moe_inference_training_forward: true
+    # Must equal generation's, which is nvls. Stated rather than left to the MCore
+    # default so the two cannot drift apart silently: the value pass and generation
+    # reduce expert outputs across EP ranks through this dispatcher, and only the
+    # NVLS combine has the batch-invariant ordered reduction. A training side on
+    # nccl computes a different sum and no amount of weight agreement recovers it.
+    # The value pass allocates its own symmetric heap on the first forward
+    # (MoELayer._allocate_parity_symmetric_buffers). That heap cannot grow, and
+    # microbatches are padded to their own longest sequence, so sizing it from the
+    # first one fails on the first larger one (job 686220: 576 tokens vs 512). This
+    # is the bound it is sized for: log-prob batch size x max sequence length
+    # (4 x 10240). Declared here so a launcher override has a key to override;
+    # run_zero_kl_precision1.sh re-derives it from ISL and LOGPROB_MBS.
+    moe_inference_training_max_tokens_per_rank: 40960
+    inference_moe_token_dispatcher_type: "nvls"
+
+    # The value pass stores no intermediates, so the backward has to come from a
+    # recompute. MCore requires exactly this granularity/module pair and rejects the
+    # config otherwise; the bf16 parent inherits recompute_granularity="full", which
+    # leaves moe_layer_recompute false and the experts with no backward graph.
+    activation_checkpointing: true
+    recompute_granularity: selective
+    recompute_modules: ["moe"]
+    # Local CUDA graphs capture the MoE layer whole, which disables the layer-level
+    # recompute the backward is built from. Inherited as none; restated because it is
+    # load-bearing here rather than a performance preference.
+    cuda_graph_impl: none
+    # Batch-invariant MoE needs the unfused permute/unpermute path so the top-k
+    # reductions use the fixed add tree. Inherited as true from the shared base.
+    moe_permute_fusion: false
+
+# No cluster block: the parent already sets 2 x 4, and run_zero_kl_precision1.sh
+# overrides both from the allocation anyway.

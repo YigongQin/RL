@@ -1,0 +1,75 @@
+# Per-module TE precision for Nemotron-H Nano v3 30B-A3B: MXFP8 experts, BF16 everywhere else.
+#
+# MXFP8 only on routed-expert GroupedLinear (linear_fc1 / linear_fc2). Everything else
+# (attention, embeddings, output, and the Mamba mixers) stays BF16 even when
+# policy.megatron_cfg.fp8_cfg.enabled=true.
+#
+# Separate from the Qwen file despite identical matchers, because the set of modules
+# the default arm catches is what differs: this is a hybrid model, so `*` is picking up
+# the Mamba mixers (in_proj / out_proj / conv1d) as well as the dense linears. They must
+# stay BF16 -- the SSM parity this recipe depends on is established at BF16 only, and
+# nothing downstream would report a quantized mixer beyond a nonzero KL.
+#
+# Matcher order matters: first match wins. Put BF16 dense matchers before MoE MXFP8.
+#
+# Apply this on BOTH train and generation. The train side needs it for a second reason
+# here: moe_inference_training_forward re-quantizes the live TE expert parameters into
+# generation's MXFP8 layout every forward, so a module that is MXFP8 on one side and
+# BF16 on the other breaks the forward equality the recipe exists to get.
+
+configs:
+  bf16:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe:
+      override_quantized_autocast: true
+    evaluation_recipe: {}
+  mxfp8_moe:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe:
+      fp8_quantization_recipe: mxfp8
+      fp8_format: hybrid
+      override_quantized_autocast: true
+    # Model construction picks evaluation_recipe whenever grad is disabled, so it has
+    # to repeat the training precision; an empty block would mean BF16.
+    evaluation_recipe:
+      fp8_quantization_recipe: mxfp8
+      fp8_format: hybrid
+      override_quantized_autocast: true
+
+matchers:
+  qkv:
+    config: bf16
+    type: glob
+    pattern: "*linear_qkv*"
+    enabled: true
+  proj:
+    config: bf16
+    type: glob
+    pattern: "*linear_proj*"
+    enabled: true
+  # Before the routed-expert matchers, and it has to be: "*experts*linear_fc1*"
+  # also matches "mlp.shared_experts.linear_fc1" (a glob's * crosses dots), which
+  # would put the dense shared expert in MXFP8. It is not part of the routed
+  # grouped-GEMM path that train and generation share, and nothing checks its
+  # precision -- the expert-policy validator only looks at modules with
+  # num_local_experts.
+  shared_experts:
+    config: bf16
+    type: glob
+    pattern: "*shared_experts*"
+    enabled: true
+  moe_fc1:
+    config: mxfp8_moe
+    type: glob
+    pattern: "*experts*linear_fc1*"
+    enabled: true
+  moe_fc2:
+    config: mxfp8_moe
+    type: glob
+    pattern: "*experts*linear_fc2*"
+    enabled: true
+  default_bf16:
+    config: bf16
+    type: glob
+    pattern: "*"
+    enabled: true

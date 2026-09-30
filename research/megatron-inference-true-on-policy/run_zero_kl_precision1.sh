@@ -234,6 +234,22 @@ case "${MODEL}" in
         # tested here is the SSM layers.
         MAMBA_PARITY="true"
         ;;
+    nanov3-mxfp8-infopt|nanov3-30ba3b-mxfp8-infopt)
+        STACK="infopt"
+        RUN_PREFIX="nanov3-mxfp8-infopt"
+        GRPO_CONFIG="examples/configs/recipes/llm/grpo-dapomath17k-nanov3-30ba3b-megatron-zero-train-gen-kl-mxfp8-noncolocated.yaml"
+        SAVE_PERIOD="${SAVE_PERIOD:-35}"
+        DEFAULT_NODES=2
+        ISL="${ISL:-10240}"
+        # Same nvls-dispatcher reasoning as the bf16 arm above.
+        #
+        # Unlike that arm, the MoE half is not relying on the two sides
+        # happening to agree: moe_inference_training_forward runs generation's
+        # vLLM kernel in the training value pass, over MXFP8 weights that refit
+        # has already quantized on the generation side. Mamba parity still
+        # applies -- the SSM layers are bf16 here and unchanged.
+        MAMBA_PARITY="true"
+        ;;
     *)
         echo "ERROR: MODEL is required." >&2
         echo "  colocated TE+mxfp8:  qwen1.5b, qwen30ba3b" >&2
@@ -244,6 +260,7 @@ case "${MODEL}" in
         echo "  non-colocated flashinfer megakernel: qwen30ba3b-mega-infopt (-N 2, GB200)" >&2
         echo "  ... the same at MXFP8 (straight-through gradient): qwen30ba3b-mega-mxfp8-infopt" >&2
         echo "  non-colocated hybrid mamba+MoE (no megakernel): nanov3-infopt (-N 2)" >&2
+        echo "  ... the same at MXFP8, training forward on the vLLM kernel: nanov3-mxfp8-infopt" >&2
         exit 1
         ;;
 esac
@@ -331,6 +348,18 @@ if [[ "${RUN_PREFIX}" == qwen30ba3b-mega-*infopt ]]; then
             "policy.generation.mcore_generation_config.inference_mega_max_tokens_per_rank=${SMOKE_MAX_TOKENS:-${ISL}}"
         )
     fi
+fi
+
+# The training forward through the vLLM kernel gathers via NVLS symmetric
+# buffers that are allocated once and cannot grow. Left to size themselves from
+# the first log-prob microbatch they break on the first larger one (job 686220:
+# 576 tokens against buffers sized for 512), because each microbatch is padded
+# to its own longest sequence. Bound them with the widest pass there can be,
+# derived from the same LOGPROB_MBS the pass is given so the two cannot drift.
+if [[ "${RUN_PREFIX}" == nanov3-mxfp8-infopt ]]; then
+    EXTRA_FLAGS+=(
+        "policy.megatron_cfg.moe_inference_training_max_tokens_per_rank=$(( ${ISL:-10240} * LOGPROB_MBS ))"
+    )
 fi
 
 RUN_TAG="${EXP_TAG:-${SLURM_JOB_ID:-$(date +%Y%m%d-%H%M%S)}}"
